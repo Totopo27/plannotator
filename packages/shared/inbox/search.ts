@@ -35,7 +35,18 @@ import {
   inboxSearchTerms,
   scanInboxSearchTokens,
   tokenizeInboxSearchText,
-  type InboxSearchSnippet,
+  INBOX_SEARCH_BROWSE_LIMIT,
+  INBOX_SEARCH_CAPS,
+  INBOX_SEARCH_GROUPS,
+  INBOX_SEARCH_LIMIT_MAX,
+  INBOX_SEARCH_RECENT_THREADS,
+  type InboxSearchAnswer,
+  type InboxSearchFrom,
+  type InboxSearchGroupId,
+  type InboxSearchProjectRef,
+  type InboxSearchQuery,
+  type InboxSearchRow,
+  type InboxSearchThreadRow,
 } from "@plannotator/core/inbox-search";
 import { findQuestionBlocks, QUESTION_ANSWERS_HEADING, type QuestionAnswer } from "@plannotator/core/question-block";
 import {
@@ -52,124 +63,27 @@ import {
 import { inboxRowArchived } from "./list";
 import type { InboxStore } from "./store";
 
-// ─────────────────────────────── Wire ───────────────────────────────
-
-export type InboxSearchGroupId = "threads" | "messages" | "files" | "decisions" | "projects";
-export const INBOX_SEARCH_GROUPS: readonly InboxSearchGroupId[] = ["threads", "messages", "files", "decisions", "projects"];
-/** Rows per group in a first answer (the brief's section 7). */
-export const INBOX_SEARCH_CAPS: Readonly<Record<InboxSearchGroupId, number>> = { threads: 5, messages: 8, files: 5, decisions: 5, projects: 3 };
-/** The most rows one group answers at a time ("Show all", "Show 50 more"). */
-export const INBOX_SEARCH_LIMIT_MAX = 50;
-/** Threads listed for filters with no words. */
-export const INBOX_SEARCH_BROWSE_LIMIT = 20;
-/** Threads under "Recent" with an empty query. */
-export const INBOX_SEARCH_RECENT_THREADS = 6;
-
-export type InboxSearchStatus = "waiting" | "new" | "sent" | "quiet" | "archived";
-export const INBOX_SEARCH_STATUSES: readonly InboxSearchStatus[] = ["waiting", "new", "sent", "quiet", "archived"];
-export type InboxSearchFrom = "agent" | "me";
-
-export interface InboxSearchQuery {
-  q: string;
-  project?: string | null;
-  status?: InboxSearchStatus | null;
-  from?: InboxSearchFrom | null;
-  /** One group only ("Show all"), from `offset`. */
-  group?: InboxSearchGroupId | null;
-  offset?: number;
-  /** Rows per group (default: the caps, or 50 for one group). */
-  limit?: number | null;
-  /** The project open in the list: a tie boost, never a filter. */
-  current?: string | null;
-}
-
-export interface InboxSearchProjectRef {
-  id: string;
-  /** The project's name, with its parent folder when two projects share one ("api · work"). */
-  name: string;
-}
-
-interface RowBase {
-  project: InboxSearchProjectRef;
-  /** The thread's section, and whether it is archived (resolved and not come back). */
-  section: InboxSectionId | null;
-  archived: boolean;
-  /** ISO time: a message's, a thread's latest message's, a decision's. */
-  at: string;
-}
-
-export interface InboxSearchThreadRow extends RowBase {
-  type: "thread";
-  id: string;
-  thread_id: string;
-  title: string;
-  /** [start, length] in `title`. */
-  title_marks: [number, number][];
-  thread_name: string | null;
-}
-
-export interface InboxSearchMessageRow extends RowBase {
-  type: "message";
-  id: string;
-  thread_id: string;
-  author: { kind: "agent" | "me"; name: string };
-  /** The thread's subject. */
-  title: string;
-  snippet: InboxSearchSnippet;
-  /** The match is in a question (its prompt, choices or answer): the "Question" chip. */
-  question: { key: string; replaced: boolean } | null;
-}
-
-export interface InboxSearchFileRow extends RowBase {
-  type: "file" | "guide";
-  /** An attachment's id, or for a guide the message that carries it. */
-  id: string;
-  thread_id: string;
-  message_id: string;
-  name: string;
-  name_marks: [number, number][];
-  /** The folder the file sits in (the last segment before its name), or null for a guide. */
-  folder: string | null;
-  /** The attachment's kind or the file's extension (`md`, `pdf`, `png`), or `guide`. */
-  kind: string;
-  title: string;
-}
-
-export interface InboxSearchDecisionRow extends RowBase {
-  type: "decision";
-  id: string;
-  text: string;
-  text_marks: [number, number][];
-  state: InboxDecision["state"];
-  from: InboxSearchFrom;
-}
-
-export interface InboxSearchProjectRow {
-  type: "project";
-  id: string;
-  project: InboxSearchProjectRef;
-  name: string;
-  name_marks: [number, number][];
-  root: string;
-  at: string;
-}
-
-export type InboxSearchRow = InboxSearchThreadRow | InboxSearchMessageRow | InboxSearchFileRow | InboxSearchDecisionRow | InboxSearchProjectRow;
-
-export interface InboxSearchAnswer {
-  q: string;
-  /** The terms searched for (the window highlights them where it lands). */
-  terms: string[];
-  took_ms: number;
-  /** The index is still being built: no groups yet; ask again. */
-  indexing: boolean;
-  /** Threads the index covers (or is building over), for "Indexing 4,212 threads…". */
-  threads: number;
-  totals: Record<InboxSearchGroupId, number> | null;
-  groups: Partial<Record<InboxSearchGroupId, InboxSearchRow[]>> | null;
-  /** An empty query with no filters: the threads the person looked at last. */
-  recent: InboxSearchThreadRow[] | null;
-}
+// The wire (answers, rows, the query) is @plannotator/core/inbox-search's, so the window reads it without this package.
+export {
+  INBOX_SEARCH_BROWSE_LIMIT,
+  INBOX_SEARCH_CAPS,
+  INBOX_SEARCH_GROUPS,
+  INBOX_SEARCH_LIMIT_MAX,
+  INBOX_SEARCH_RECENT_THREADS,
+  INBOX_SEARCH_STATUSES,
+  type InboxSearchAnswer,
+  type InboxSearchDecisionRow,
+  type InboxSearchFileRow,
+  type InboxSearchFrom,
+  type InboxSearchGroupId,
+  type InboxSearchMessageRow,
+  type InboxSearchProjectRef,
+  type InboxSearchProjectRow,
+  type InboxSearchQuery,
+  type InboxSearchRow,
+  type InboxSearchStatus,
+  type InboxSearchThreadRow,
+} from "@plannotator/core/inbox-search";
 
 // ─────────────────────────────── Text ───────────────────────────────
 
