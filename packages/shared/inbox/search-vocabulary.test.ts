@@ -7,7 +7,7 @@
  * plain model.
  */
 import { describe, expect, test } from "bun:test";
-import { ID_BUCKETS, isIdLikeToken, Postings, Vocabulary } from "./search-vocabulary";
+import { canPrefixId, fnvString, ID_BUCKETS, ID_PREFIX_KEEP, ID_PREFIX_LENGTH, isIdLikeToken, Postings, Vocabulary } from "./search-vocabulary";
 
 describe("id-like tokens", () => {
   test("hashes, long numbers, ULIDs and UUID parts are ids; words, short numbers and short hex words are not", () => {
@@ -34,13 +34,37 @@ describe("id-like tokens", () => {
     expect(vocab.idOf(hash)).toBe(fromSpan);
     expect(vocab.count()).toBe(0);
     expect(vocab.bucketCount()).toBe(1);
-    // Its prefix is not a word, and the whole id answers only its bucket.
+    // The caller gets the whole value's hash, its first 12 characters (lower case) and their first 7's hash, to keep beside the bucket.
+    expect(vocab.lastWasId).toBe(true);
+    expect(vocab.lastHash).toBe(fnvString(hash));
+    expect(String.fromCharCode(...vocab.lastPrefix.subarray(0, vocab.lastPrefixLength))).toBe(hash.slice(0, ID_PREFIX_KEEP));
+    expect(vocab.lastPrefixHash).toBe(fnvString(hash.slice(0, ID_PREFIX_LENGTH)));
+    // An id with a letter is posted by its first 7 characters: its whole value and its starts share the bucket.
+    expect(vocab.prefixBucketOf(fnvString(hash.slice(0, ID_PREFIX_LENGTH)))).toBe(fromSpan);
+    // The same from a string; a word after it is not an id.
+    expect(vocab.idOfToken(hash)).toBe(fromSpan);
+    expect(vocab.lastPrefixHash).toBe(fnvString(hash.slice(0, ID_PREFIX_LENGTH)));
+    vocab.idOfToken("landed");
+    expect(vocab.lastWasId).toBe(false);
+    // A number is an id without a start, posted by its whole value: it is found by that only.
+    const number = vocab.idOfSpan("at 1760000000123", 3, 16, false);
+    expect([vocab.lastWasId, vocab.lastPrefixLength]).toEqual([true, 0]);
+    expect(vocab.numberBucketOf(fnvString("1760000000123"))).toBe(number);
+    // Ids are not words: a word prefix never answers them (the index matches them through their buckets).
     expect(vocab.prefixIds("9fceb02")).toEqual([]);
-    expect(vocab.prefixIds(hash)).toEqual([fromSpan]);
-    // Never more buckets than ID_BUCKETS, however many ids.
-    for (let i = 0; i < 40_000; i++) vocab.idOfToken(`${(i * 2654435761 >>> 0).toString(16).padStart(8, "0")}${i}`);
-    expect(vocab.bucketCount()).toBeLessThanOrEqual(ID_BUCKETS);
-    expect(vocab.count()).toBe(0);
+    expect(vocab.prefixIds(hash)).toEqual([]);
+    // Never more buckets than ID_BUCKETS of each kind, however many ids.
+    for (let i = 0; i < 200_000; i++) {
+      vocab.idOfToken(`${(i * 2654435761 >>> 0).toString(16).padStart(8, "0")}${i}`);
+      vocab.idOfToken(String(1_760_000_000_000 + i * 7919));
+    }
+    expect(vocab.bucketCount()).toBeLessThanOrEqual(2 * ID_BUCKETS);
+    expect(vocab.count()).toBe(1);
+  });
+
+  test("a query term may start an id from 7 letters and digits with a letter, and a digit or only hex letters", () => {
+    for (const term of ["9fceb02", "9fceb02d0ae5", "deadbee", "01m4v7j"]) expect([term, canPrefixId(term)]).toEqual([term, true]);
+    for (const term of ["9fceb0", "release", "requests", "naïve12", "abc-123", "1760003", "1760003000148"]) expect([term, canPrefixId(term)]).toEqual([term, false]);
   });
 });
 

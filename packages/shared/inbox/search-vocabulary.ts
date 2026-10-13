@@ -12,12 +12,17 @@
  * - **ID-like tokens share buckets.** A token that reads as an identifier
  *   (`isIdLikeToken`: 8 or more hex characters with digits and letters, such
  *   as commit hashes and UUID parts; more than 8 digits, such as timestamps;
- *   16 or more characters with 3 or more digits mixed through it, such as ULIDs and base32 or
- *   base64 ids) is not a word of its own: it is posted under one of
- *   `ID_BUCKETS` shared ids by its hash. A query term that reads as an id
- *   looks up its bucket, and the index checks each candidate's text for the
- *   term itself (`isBucket`), so an id is found by its whole value, never by a
- *   prefix of it.
+ *   16 or more characters with 3 or more digits mixed through it, such as
+ *   ULIDs and base32 or base64 ids) is not a word of its own. It is posted
+ *   once, under one of `ID_BUCKETS` shared ids: an id with a letter (a SHA, a
+ *   ULID) by the hash of its first `ID_PREFIX_LENGTH` characters, so its
+ *   whole value and every start of 7 characters or more (git's short SHA)
+ *   find the same bucket; a number (a timestamp, whose first digits many share)
+ *   by the hash of its whole value, and it has no start. The search index
+ *   keeps the id's first `ID_PREFIX_KEEP` characters and bits of its hash
+ *   beside the bucket id in the document's token stream (`lastHash`,
+ *   `lastPrefix`), so a query confirms an id, or a start of it up to 12
+ *   characters, from bytes it already holds.
  * - **Postings share one arena.** Each id keeps its first document, its count
  *   and its first block; a word seen in one document has nothing else. Later
  *   documents are delta varints in blocks of one arena, growing from 8 to
@@ -31,8 +36,19 @@
  * first seen, so the common words, seen first, keep one-byte varints.
  */
 
-/** How many shared ids the id-like tokens hash into. */
-export const ID_BUCKETS = 8192;
+/**
+ * How many shared ids the id-like tokens hash into, for ids with a letter and
+ * for numbers each. Enough that a bucket's documents are a small share of an
+ * id-dense store (a log holding 8,000 ids touches about 12% of them), so an
+ * id query reads few documents; allocated as they are first used.
+ */
+export const ID_BUCKETS = 1 << 16;
+
+/** An id with a letter is also found by its first this many characters and more (git's short SHA). */
+export const ID_PREFIX_LENGTH = 7;
+
+/** How many of an id's first characters the index keeps beside it, to confirm a start of up to this length without the text. */
+export const ID_PREFIX_KEEP = 12;
 
 /** Arrays grow by half again, not double: the slack is memory too. */
 function grownLength(current: number, need: number): number {
@@ -54,7 +70,7 @@ function growUint8(array: Uint8Array<ArrayBuffer>, need: number): Uint8Array<Arr
   return grown;
 }
 
-function fnvString(text: string): number {
+export function fnvString(text: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
   return h >>> 0;
@@ -96,6 +112,28 @@ function isIdLikeSpan(text: string, start: number, end: number): boolean {
   return length >= 16 && digits >= 3 && switches >= 3;
 }
 
+/**
+ * Whether a query's last term may be the start of an id, looked up in the
+ * prefix buckets: at least `ID_PREFIX_LENGTH` letters and digits with a
+ * letter, and a digit or only hex letters (`9fceb02`, `deadbee`; not
+ * `release`, and not a number: numbers are found by their whole value).
+ */
+export function canPrefixId(term: string): boolean {
+  if (term.length < ID_PREFIX_LENGTH) return false;
+  let digit = false;
+  let letter = false;
+  let hex = true;
+  for (let i = 0; i < term.length; i++) {
+    const c = term.charCodeAt(i);
+    if (c >= 0x30 && c <= 0x39) digit = true;
+    else if (c >= 0x61 && c <= 0x7a) {
+      letter = true;
+      if (c > 0x66) hex = false;
+    } else return false;
+  }
+  return letter && (digit || hex);
+}
+
 /** `length` 0 marks a bucket (no word is empty); `RICH` a word kept as a string. */
 const RICH = 255;
 
@@ -117,8 +155,23 @@ export class Vocabulary {
   private old: Int32Array | null = null;
   private oldCursor = 0;
   private words = 0;
-  /** Bucket number -> id (0: not seen yet). */
+  /** Bucket number -> id (0: not seen yet): numbers by their whole hash, ids with a letter by their first 7 characters'. */
   private buckets = new Int32Array(ID_BUCKETS);
+  private prefixBuckets = new Int32Array(ID_BUCKETS);
+  /**
+   * Set by the last `idOfSpan` / `idOfToken`: whether the token was an id, its
+   * whole 32-bit hash, its first `ID_PREFIX_KEEP` characters (lower case;
+   * `lastPrefixLength` 0 for a number, which has no start) and the hash of
+   * its first `ID_PREFIX_LENGTH` (the caller keeps hash bits and the
+   * characters in the token stream).
+   */
+  lastWasId = false;
+  lastHash = 0;
+  readonly lastPrefix = new Uint8Array(ID_PREFIX_KEEP);
+  lastPrefixLength = 0;
+  /** The id's length (an id of up to `ID_PREFIX_KEEP` characters is kept whole). */
+  lastIdLength = 0;
+  lastPrefixHash = 0;
   /** Word ids by their first two UTF-16 units (the first alone for a one-unit word), and how many of each list are used. */
   private byPrefix = new Map<number, Int32Array>();
   private byPrefixUsed = new Map<number, number>();
@@ -155,16 +208,42 @@ export class Vocabulary {
     return true;
   }
 
-  private bucketId(hash: number, create: boolean): number {
+  private bucketId(hash: number, create: boolean, table: Int32Array = this.buckets): number {
     const bucket = hash % ID_BUCKETS;
-    const known = this.buckets[bucket]!;
+    const known = table[bucket]!;
     if (known !== 0) return known;
     if (!create) return -1;
     const id = this.newId();
     this.start[id] = bucket;
     this.length[id] = 0;
-    this.buckets[bucket] = id;
+    table[bucket] = id;
     return id;
+  }
+
+  /** A number's bucket, by the hash of its whole value (-1 when no number has used it). */
+  numberBucketOf(hash: number): number {
+    return this.bucketId(hash, false);
+  }
+
+  /** The bucket of ids with a letter that start with characters whose first 7 hash to `prefixHash` (-1 when none). */
+  prefixBucketOf(prefixHash: number): number {
+    return this.bucketId(prefixHash, false, this.prefixBuckets);
+  }
+
+  /** An id: its bucket (by its first 7 characters, or a number's whole value); its hash and first characters kept for the caller. */
+  private idHit(text: string, start: number, end: number, upper: boolean, hash: number, prefixHash: number, letter: boolean): number {
+    this.lastWasId = true;
+    this.lastHash = hash;
+    this.lastPrefixHash = prefixHash;
+    const keep = letter ? Math.min(end - start, ID_PREFIX_KEEP) : 0;
+    for (let k = 0; k < keep; k++) {
+      let c = text.charCodeAt(start + k);
+      if (upper && c >= 0x41 && c <= 0x5a) c += 0x20;
+      this.lastPrefix[k] = c;
+    }
+    this.lastPrefixLength = keep;
+    this.lastIdLength = end - start;
+    return letter ? this.bucketId(prefixHash, true, this.prefixBuckets) : this.bucketId(hash, true);
   }
 
   private newId(): number {
@@ -209,7 +288,7 @@ export class Vocabulary {
   /** The id of a folded token (its bucket for an id-like one), or -1 for one never seen. */
   idOf(token: string): number {
     const h = fnvString(token);
-    if (isIdLikeToken(token)) return this.bucketId(h, false);
+    if (isIdLikeToken(token)) return /[a-z]/.test(token) ? this.prefixBucketOf(fnvString(token.slice(0, ID_PREFIX_LENGTH))) : this.numberBucketOf(h);
     const id = this.probeString(this.slots, token, h);
     if (id >= 0 || !this.old) return id;
     return this.probeString(this.old, token, h);
@@ -217,14 +296,20 @@ export class Vocabulary {
 
   /** The id of the ASCII token `text[start, end)` (lower-cased when `upper`), added when new. */
   idOfSpan(text: string, start: number, end: number, upper: boolean): number {
+    this.lastWasId = false;
     let h = 0x811c9dc5;
+    let prefixHash = 0;
+    let letter = false;
+    const prefixEnd = start + ID_PREFIX_LENGTH - 1;
     for (let k = start; k < end; k++) {
       let c = text.charCodeAt(k);
+      if (c > 0x39) letter = true;
       if (upper && c >= 0x41 && c <= 0x5a) c += 0x20;
       h = Math.imul(h ^ c, 0x01000193);
+      if (k === prefixEnd) prefixHash = h >>> 0;
     }
     h >>>= 0;
-    if (isIdLikeSpan(text, start, end)) return this.bucketId(h, true);
+    if (isIdLikeSpan(text, start, end)) return this.idHit(text, start, end, upper, h, prefixHash, letter);
     const length = end - start;
     if (length >= RICH) {
       const raw = text.slice(start, end);
@@ -254,10 +339,11 @@ export class Vocabulary {
 
   /** The id of a folded token, added when new (its bucket for an id-like one). */
   idOfToken(token: string): number {
+    this.lastWasId = false;
+    if (isIdLikeToken(token)) return this.idHit(token, 0, token.length, false, fnvString(token), fnvString(token.slice(0, ID_PREFIX_LENGTH)), /[a-z]/.test(token));
     const known = this.idOf(token);
     if (known >= 0) return known;
     const h = fnvString(token);
-    if (isIdLikeToken(token)) return this.bucketId(h, true);
     let ascii = token.length < RICH;
     for (let i = 0; ascii && i < token.length; i++) if (token.charCodeAt(i) > 0x7f) ascii = false;
     if (ascii) return this.idOfSpan(token, 0, token.length, false);
@@ -348,13 +434,9 @@ export class Vocabulary {
     return true;
   }
 
-  /** The ids a last term matches as a prefix: the words starting with it; for an id-like term, its bucket alone. */
+  /** The words a last term matches as a prefix (ids are matched through their buckets by the index, not here). */
   prefixIds(prefix: string): number[] {
     if (prefix.length === 0) return [];
-    if (isIdLikeToken(prefix)) {
-      const id = this.bucketId(fnvString(prefix), false);
-      return id < 0 ? [] : [id];
-    }
     const out: number[] = [];
     const scan = (key: number) => {
       const list = this.byPrefix.get(key);

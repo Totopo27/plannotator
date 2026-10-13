@@ -24,6 +24,7 @@ import {
   type InboxSearchThreadRow,
 } from "./search";
 import { InboxStore } from "./store";
+import { fnvString, ID_BUCKETS } from "./search-vocabulary";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -155,6 +156,21 @@ describe("groups and rows", () => {
     expect(messageIds(search(index, "jitter yes"))).toEqual([root.id]);
   });
 
+  test("a long message's row is drawn from the lines around its first hit, with the words marked", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "logs", root: "/w/logs" });
+    const lines = Array.from({ length: 6000 }, (_, k) => `${1_760_000_000_000 + k} INFO worker heartbeat ok`);
+    lines[5200] = "1760000005200 ERROR worker Replica-Lag exceeded on db-7";
+    const message = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Worker log", thread: "log", body: "```\n" + lines.join("\n") + "\n```" }).message;
+    const index = await built(store);
+    for (const q of ["replica lag", "REPLICA-LAG exceeded"]) {
+      const row = search(index, q).groups!.messages![0] as InboxSearchMessageRow;
+      expect(row.id).toBe(message.id);
+      expect(row.snippet.text).toContain("Replica-Lag exceeded");
+      expect(marked(row.snippet.text, row.snippet.marks).map((m) => m.toLowerCase())).toEqual(q.toLowerCase().split(/[\s-]+/).map((w) => w));
+    }
+  });
+
   test("Show all: one group from an offset; totals stay whole", async () => {
     const store = open();
     const project = store.ensureProject({ name: "api", root: "/w/api" });
@@ -245,13 +261,25 @@ describe("ranking", () => {
 });
 
 describe("identifiers", () => {
-  test("hashes, ULIDs, UUIDs and timestamps are found by their whole value; thousands of them share buckets without false matches", async () => {
+  const hex40 = (seed: string) => (Bun.hash(`${seed}a`).toString(16).padStart(16, "0") + Bun.hash(`${seed}b`).toString(16).padStart(16, "0") + Bun.hash(`${seed}c`).toString(16).padStart(16, "0")).slice(0, 40);
+  /** Two different ids whose whole-value hashes fall in one bucket (a birthday search). */
+  function collidingIds(): [string, string] {
+    const seen = new Map<number, string>();
+    for (let i = 0; ; i++) {
+      const id = hex40(`c${i}`);
+      const hash = fnvString(id);
+      const other = seen.get(hash % ID_BUCKETS);
+      if (other !== undefined && fnvString(other) !== hash) return [other, id];
+      seen.set(hash % ID_BUCKETS, id);
+    }
+  }
+
+  test("hashes, ULIDs, UUIDs and timestamps are found by their whole value among thousands", async () => {
     const store = open();
     const project = store.ensureProject({ name: "api", root: "/w/api" });
     const ids: { id: string; message: string }[] = [];
-    // 3,000 messages with 4 ids each: 12,000 ids over 8,192 buckets, so buckets are shared.
     for (let i = 0; i < 3000; i++) {
-      const hash = Bun.hash(`h${i}`).toString(16).padStart(16, "0") + Bun.hash(`k${i}`).toString(16).padStart(16, "0");
+      const hash = hex40(`h${i}`);
       const ulid = `01M4V7${Bun.hash(`u${i}`).toString(32).toUpperCase().padStart(14, "0")}${i}`.slice(0, 26);
       const stamp = String(1_760_000_000_000 + i * 7919);
       const uuid = `${hash.slice(0, 8)}-1a2b-4c3d-8e9f-${hash.slice(8, 20)}`;
@@ -259,16 +287,93 @@ describe("identifiers", () => {
       for (const id of [hash, ulid, stamp, uuid]) ids.push({ id, message: message.id });
     }
     const index = await built(store);
-    expect(index.lastBuildStats()!.idBuckets).toBeLessThanOrEqual(8192);
+    expect(index.lastBuildStats()!.idBuckets).toBeLessThanOrEqual(2 * ID_BUCKETS);
     for (const { id, message } of ids.filter((_, i) => i % 7 === 0)) expect([id, messageIds(search(index, id))]).toEqual([id, [message]]);
     // With other words, in either order, and upper or lower case.
     const { id, message } = ids[40]!;
     expect(messageIds(search(index, `commit ${id.toLowerCase()}`))).toEqual([message]);
     expect(messageIds(search(index, `${id} commit`))).toEqual([message]);
-    // Found by its whole value only: a prefix of an id is not a match (search-vocabulary.ts).
-    expect(messageIds(search(index, ids[0]!.id.slice(0, 12)))).toEqual([]);
     // A well-formed id that is in no message.
     expect(messageIds(search(index, "9fceb02d0ae598e95dc970b74767f19372d61af8"))).toEqual([]);
+  });
+
+  test("a short SHA finds the full one: any start of 7 characters or more, never fewer, never a different id", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const full = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+    const sibling = "9fceb02aaaa598e95dc970b74767f19372d61af8";
+    const a = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Deploy", thread: "a", body: `Deployed ${full.toUpperCase()} to staging.` }).message;
+    const b = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Revert", thread: "b", body: `Reverted ${sibling}.` }).message;
+    const index = await built(store);
+    expect(messageIds(search(index, "9fceb02")).sort()).toEqual([a.id, b.id].sort());
+    expect(messageIds(search(index, "9fceb02d"))).toEqual([a.id]);
+    expect(messageIds(search(index, "9fceb02d0ae5"))).toEqual([a.id]);
+    expect(messageIds(search(index, "deployed 9fceb02d0ae5"))).toEqual([a.id]);
+    expect(messageIds(search(index, full))).toEqual([a.id]);
+    // Longer than the 12 characters kept: the text decides, in the documents whose ids start with the first 12.
+    expect(messageIds(search(index, full.slice(0, 20)))).toEqual([a.id]);
+    expect(messageIds(search(index, `${full.slice(0, 19)}0`))).toEqual([]);
+    // Fewer than 7 characters, or a start the id does not have.
+    expect(messageIds(search(index, "9fceb0"))).toEqual([]);
+    expect(messageIds(search(index, "9fceb02x"))).toEqual([]);
+    expect(messageIds(search(index, "9fceb02d0ae6"))).toEqual([]);
+    // The whole value ranks above a match on its start.
+    const exact = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Tag", thread: "c", body: "Tagged 9fceb02d0ae5 by hand." }).message;
+    expect(messageIds(search(index, "9fceb02d0ae5"))).toEqual([exact.id, a.id]);
+    // The snippet marks the start of the full id.
+    const row = search(index, "9fceb02d0ae5").groups!.messages!.find((m) => m.id === a.id) as InboxSearchMessageRow;
+    expect(marked(row.snippet.text, row.snippet.marks).map((m) => m.toLowerCase())).toEqual(["9fceb02d0ae5"]);
+  });
+
+  test("ids whose buckets collide are told apart by their hashes: no false match, and no title match from the other one", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const [idA, idB] = collidingIds();
+    // The older decision holds idB in its title; the newer holds idA in its title and idB only in its reason.
+    const older = decision(store, project.id, `Pin ${idB} for the release`);
+    const newer = decision(store, project.id, `Pin ${idA} for the release`, { reason: `It replaces ${idB}.` });
+    const index = await built(store);
+    const rows = (q: string) => search(index, q).groups!.decisions!.map((r) => r.id);
+    // idB: both, the title match first even though it is older (a bucket match in the newer one's title used to count).
+    expect(rows(idB)).toEqual([older.id, newer.id]);
+    // idA: only the decision that holds it.
+    expect(rows(idA)).toEqual([newer.id]);
+    // As a phrase: "pin <idB>" is a phrase only in the older one, so it ranks first though older (the newer holds both words apart).
+    expect(rows(`pin ${idB}`)).toEqual([older.id, newer.id]);
+  });
+
+  test("an id query reads no document text: whole values, ids in no document, and starts of 7 to 12 characters are decided from the index", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "logs", root: "/w/logs" });
+    let sample = "";
+    for (let i = 0; i < 40; i++) {
+      const lines: string[] = [];
+      for (let k = 0; k < 500; k++) {
+        const sha = hex40(`l${i}-${k}`).slice(0, 12);
+        if (i === 3 && k === 5) sample = sha;
+        lines.push(`${1_760_000_000_000 + i * 1_000_000 + k * 37} INFO worker request ${sha} done`);
+      }
+      store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Log ${i}`, thread: `t${i}`, body: "```\n" + lines.join("\n") + "\n```" });
+    }
+    const index = await built(store);
+    let reads = 0;
+    const own = index as unknown as { docTexts: (doc: unknown) => string[] };
+    const docTexts = own.docTexts.bind(index);
+    own.docTexts = (doc) => {
+      reads += 1;
+      return docTexts(doc);
+    };
+    for (const q of [sample, `${sample} worker`, `worker ${sample}`, "1760003000148", "1760003000149", "1760003", "deadbeef1234", sample.slice(0, 7), sample.slice(0, 10), `worker ${sample.slice(0, 9)}`]) {
+      expect(search(index, q).totals!.messages).toBeGreaterThanOrEqual(0);
+      expect([q, reads]).toEqual([q, 0]);
+    }
+    expect(search(index, sample).totals!.messages).toBe(1);
+    expect(search(index, "1760003000148").totals!.messages).toBe(1);
+    expect(search(index, "1760003000149").totals!.messages).toBe(0);
+    expect(search(index, sample.slice(0, 10)).totals!.messages).toBe(1);
+    // Numbers are found by their whole value only.
+    expect(search(index, "1760003").totals!.messages).toBe(0);
+    expect(reads).toBe(0);
   });
 });
 
