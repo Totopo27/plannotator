@@ -228,6 +228,43 @@ describe("Inbox over your tailnet", () => {
     expect((await fetch(`http://127.0.0.1:${inbox.port}${path}`)).status).toBe(200);
   });
 
+  test("search answers the owner through the tailnet like the other read routes; recent searches take the owner's same-origin write; a wrong login and another site are refused", async () => {
+    const dataDir = world({ inboxTailscale: true });
+    const inbox = await start(dataDir, fakeTailscale().run);
+    const project = inbox.store.ensureProject({ name: "api", root: join(dataDir, "api") });
+    const { message } = inbox.store.sendMessage({
+      project_id: project.id,
+      author: { kind: "agent", host: "test", session: "ses_tailnet", name: null },
+      subject: "Relay rate limit",
+      body: "The relay allows 20 mailbox creates a minute.",
+    });
+    const path = "/api/inbox/search?q=rate%20limit";
+    let answer: Json = {};
+    for (let i = 0; i < 40; i++) {
+      const ok = await throughServe(inbox, path, { headers: { "Sec-Fetch-Site": "same-origin" } });
+      expect(ok.status).toBe(200);
+      answer = (await ok.json()) as Json;
+      if (!answer.indexing) break;
+    }
+    expect((answer.groups as { threads: { id: string }[] }).threads.map((t) => t.id)).toEqual([message.id]);
+    expect(await codeOf(await throughServe(inbox, path, { login: "someone@example.com" }))).toEqual([403, "tailnet_identity_refused"]);
+    expect(await codeOf(await throughServe(inbox, path, { headers: { "Sec-Fetch-Site": "cross-site" } }))).toEqual([403, "cross_site"]);
+    const origin = `https://${MAGIC}:${inbox.port}`;
+    const saved = await throughServe(inbox, "/api/inbox/search/recent", {
+      method: "POST",
+      headers: { Origin: origin, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "rate limit", serverSession: inbox.serverSession }),
+    });
+    expect(saved.status).toBe(200);
+    expect(((await saved.json()) as Json).recent_searches).toEqual(["rate limit"]);
+    const foreign = await throughServe(inbox, "/api/inbox/search/recent", {
+      method: "POST",
+      headers: { Origin: "https://evil.example", "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "x" }),
+    });
+    expect(foreign.status).toBe(403);
+  });
+
   test("/mcp answers only a loopback Host, even when PLANNOTATOR_ALLOWED_HOSTS widens the window", async () => {
     const dataDir = world();
     setEnv("PLANNOTATOR_ALLOWED_HOSTS", "*");

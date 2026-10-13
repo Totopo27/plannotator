@@ -78,6 +78,8 @@ import {
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 import { normalizeStableVersion, readUpdateState } from "@plannotator/shared/update-check";
 import { isLoopbackHostHeader } from "@plannotator/shared/loopback-host";
+import type { InboxSearchIndex, InboxSearchIndexOptions } from "@plannotator/shared/inbox/search";
+import { createInboxSearchRoutes } from "./inbox-search";
 import { isSameOriginOrNoOrigin } from "@plannotator/shared/request-origin";
 import { InboxError } from "@plannotator/shared/inbox/schema";
 import { InboxStore } from "@plannotator/shared/inbox/store";
@@ -256,6 +258,8 @@ export interface InboxServerOptions {
    * Tests give temp folders and fake CLIs.
    */
   agentEnvironment?: AgentEnvironment;
+  /** Tests: how the search index slices its build (packages/shared/inbox/search.ts). Default: 6 ms slices that yield. */
+  searchIndex?: InboxSearchIndexOptions;
 }
 
 /**
@@ -285,6 +289,8 @@ export interface InboxServer {
    * run at a time; a call while one runs gets that run's report.
    */
   connectAgents: () => Promise<InboxConnectReport>;
+  /** The search index (built on the first search): tests and the benchmark read its build stats. */
+  search: InboxSearchIndex;
   stop: () => void;
 }
 
@@ -457,6 +463,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   // A send a crash interrupted leaves a temp blob; the next start removes it once it is stale.
   sweepStaleInboxSendTemps(store.dir);
   const serverSession = createServerSessionNonce();
+  // Search (packages/server/inbox-search.ts): the index is built on the first search, not here.
+  const search = createInboxSearchRoutes({ store, serverSession, index: options.searchIndex });
   // Mark read: the note to the asking agents goes once the Undo window has passed.
   const setAsideDelayMs = options.setAsideDelayMs ?? INBOX_SET_ASIDE_DELAY_MS;
   const setAsideTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -1486,6 +1494,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json({ show, sound: soundState() });
       }
 
+      // Search: a read route (and the recent searches the window writes on opening a result).
+      const searched = await search.handle(req, url);
+      if (searched) return searched;
+
       const threadMatch = /^\/api\/inbox\/threads\/([A-Za-z0-9_]+)$/.exec(path);
       if (threadMatch && req.method === "GET") {
         // The window's thread: each message's seq (what is new since the last look) and a reply's sent annotations.
@@ -1760,6 +1772,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     for (const timer of setAsideTimers) clearTimeout(timer);
     setAsideTimers.clear();
     updates.stop();
+    search.dispose();
     void mcp.close().catch(() => {});
     server.stop(true);
     // The tailnet mapping and the door listener, the Wi-Fi listener and its
@@ -1771,7 +1784,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     tailnetStopFailedPort = tailscale.stop().failedPort;
   };
 
-  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, connectAgents, stop };
+  return { port, url: baseUrl, token, serverSession, portChanged, store, registry, tailscale, connectAgents, search: search.index, stop };
 }
 
 /** Print where the Inbox is, and open it when a person asked for it. */

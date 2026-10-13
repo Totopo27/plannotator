@@ -281,6 +281,8 @@ export class InboxStore {
   private readonly guideFileSets = new Map<string, ReadonlyMap<string, DiffFile>>();
   private readonly tornFiles = new Set<string>();
   private readonly listeners = new Set<InboxListener>();
+  /** How many times the store was read again from disk (a deletion): a reader's derived view is stale once it changes. */
+  private reloads = 0;
   private readonly now: () => Date;
 
   private constructor(dataDir: string, now: () => Date) {
@@ -442,6 +444,27 @@ export class InboxStore {
     const out: InboxLine[] = [];
     for (const line of this.latest.values()) if (line.seq > cursor) out.push(line);
     return out.sort((a, b) => a.seq - b.seq);
+  }
+
+  /**
+   * Counts the store's re-reads from disk (after a deletion). Lines are told
+   * to subscribers; a re-read is not, so a reader that keeps a derived view
+   * (the search index) compares this number instead.
+   */
+  reloadCount(): number {
+    return this.reloads;
+  }
+
+  /** Every thread's root id, in the order the threads began. */
+  threadIds(): string[] {
+    const out: string[] = [];
+    for (const [threadId] of this.threadMembers) if (this.messages.get(threadId)?.thread_id === threadId) out.push(threadId);
+    return out;
+  }
+
+  /** A thread's message ids in seq order. */
+  threadMessageIds(threadId: string): readonly string[] {
+    return this.threadMembers.get(threadId) ?? [];
   }
 
   subscribe(listener: InboxListener): () => void {
@@ -2106,6 +2129,7 @@ export class InboxStore {
    * is never touched.
    */
   private reload(deletedMarkups: ReadonlySet<string> = new Set()): void {
+    this.reloads += 1;
     this.latest.clear();
     this.projectsById.clear();
     this.projectsByRoot.clear();

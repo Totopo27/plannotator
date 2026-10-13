@@ -1,0 +1,383 @@
+/**
+ * Inbox search's index on a real store in a temp dir: what is indexed and
+ * where it groups, ranking (phrase, whole word, prefix; title before body;
+ * open before archived; the current project wins ties only; newest first),
+ * filters (project, status, from), archived labels, non-Latin text, the
+ * index following the store's lines (a send, a pick, an archive, a replaced
+ * question's subject, a decision, a deletion), and a build in slices that
+ * yields and survives searches and writes while it runs.
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { inboxId, type InboxAuthor, type InboxDecision } from "@plannotator/core/inbox-types";
+import type { InboxAttachment } from "@plannotator/core/inbox-types";
+import {
+  InboxSearchIndex,
+  inboxSearchBodyText,
+  inboxSearchReplyText,
+  type InboxSearchAnswer,
+  type InboxSearchFileRow,
+  type InboxSearchMessageRow,
+  type InboxSearchQuery,
+  type InboxSearchThreadRow,
+} from "./search";
+import { InboxStore } from "./store";
+
+const roots: string[] = [];
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function open() {
+  const dir = mkdtempSync(join(tmpdir(), "plannotator-inbox-search-"));
+  roots.push(dir);
+  // Each record a minute after the last, so "newest first" is never a tie.
+  return InboxStore.open(dir, { now: () => new Date((clock += 60_000)) });
+}
+
+const CLAUDE: Extract<InboxAuthor, { kind: "agent" }> = { kind: "agent", host: "claude-code", session: "ses_a", name: null };
+const PI: Extract<InboxAuthor, { kind: "agent" }> = { kind: "agent", host: "pi", session: "ses_b", name: null };
+const ASK = (prompt: string, choices: string[], extra = "") => ["", ":::question", prompt, "", ...(extra ? [extra, ""] : []), ...choices.map((c) => `- [ ] ${c}`), ":::"].join("\n");
+
+let clock = Date.parse("2026-10-01T10:00:00Z");
+
+async function built(store: InboxStore) {
+  const index = new InboxSearchIndex(store);
+  await index.ensureBuilt();
+  return index;
+}
+
+const search = (index: InboxSearchIndex, q: string, more: Omit<InboxSearchQuery, "q"> = {}): InboxSearchAnswer => index.search({ q, ...more });
+const threadIds = (answer: InboxSearchAnswer) => (answer.groups?.threads ?? []).map((r) => r.id);
+const messageIds = (answer: InboxSearchAnswer) => (answer.groups?.messages ?? []).map((r) => r.id);
+const marked = (text: string, marks: [number, number][]) => marks.map(([a, l]) => text.slice(a, a + l));
+
+function attachment(name: string, path: string): InboxAttachment {
+  return { id: inboxId("att"), path, named_path: null, name, kind: "markdown", sent_sha256: "0".repeat(64), size: 10, sent_at: new Date().toISOString(), sent_mtime: new Date().toISOString() };
+}
+
+function decision(store: InboxStore, projectId: string, text: string, options: { reason?: string; kind?: "answer" | "agent" | "person"; threadId?: string | null; state?: InboxDecision["state"] } = {}): InboxDecision {
+  const record: InboxDecision = {
+    id: inboxId("dec"),
+    project_id: projectId,
+    text,
+    reason: options.reason ?? null,
+    source: { kind: options.kind ?? "agent", question_id: null, message_id: options.threadId ?? null, thread_id: options.threadId ?? null, agent: null },
+    state: options.state ?? "current",
+    version: 1,
+    replaces_id: null,
+    replacement_id: null,
+    created_at: new Date().toISOString(),
+    changed_at: null,
+    idempotency_key: null,
+  };
+  store.writeDecision(record);
+  return record;
+}
+
+describe("text the index reads", () => {
+  test("a body: question blocks, images and link targets out; link labels and code kept", () => {
+    const body = ["# Retry storm", "", "See [the runbook](https://example.com/runbook) and ![chart](chart.png).", "", "```ts", "const backoff = jitter(1000);", "```", ASK("Keep the budget?", ["Yes", "No"])].join("\n");
+    const text = inboxSearchBodyText(body);
+    expect(text).toContain("Retry storm");
+    expect(text).toContain("the runbook");
+    expect(text).not.toContain("example.com");
+    expect(text).not.toContain("chart");
+    expect(text).toContain("const backoff = jitter(1000);");
+    expect(text).not.toContain("Keep the budget");
+  });
+
+  test("a reply: the person's own words, not the generated first line and not the answers section", () => {
+    const body = "Answered 2 questions, skipped 1.\n\nAdd jitter, please.\n\n## Answers to your questions\n\n1. Keep the budget? Yes";
+    expect(inboxSearchReplyText(body)).toBe("Add jitter, please.");
+  });
+});
+
+describe("groups and rows", () => {
+  test("a thread, its message, its question, its file, its guide, a decision and a project each land in their group", async () => {
+    const store = open();
+    const relay = store.ensureProject({ name: "plannotator", root: "/src/plannotator" });
+    const root = store.sendMessage({
+      project_id: relay.id,
+      author: CLAUDE,
+      subject: "Relay: rate limit on mailbox creation",
+      thread: "relay",
+      body: `The relay brakes one thing: creating a mailbox.${ASK("Keep the rate limit at 20 a minute?", ["Keep 20", "Raise to 60"])}`,
+      attachments: [attachment("relay-rate-limits.md", "/src/plannotator/adr/implementation/relay-rate-limits.md")],
+    }).message;
+    decision(store, relay.id, "Mailbox creation keeps a rate limit of 20 a minute", { kind: "answer", threadId: root.id });
+    const index = await built(store);
+    const answer = search(index, "rate lim");
+    expect(answer.indexing).toBe(false);
+    expect(threadIds(answer)).toEqual([root.id]);
+    const thread = answer.groups!.threads![0] as InboxSearchThreadRow;
+    expect(marked(thread.title, thread.title_marks)).toEqual(["rate", "lim"]);
+    // The message once, from its question (the body has no "rate").
+    expect(messageIds(answer)).toEqual([root.id]);
+    const message = answer.groups!.messages![0] as InboxSearchMessageRow;
+    expect(message.question?.key).toBeTruthy();
+    expect(marked(message.snippet.text, message.snippet.marks)).toEqual(["rate", "lim"]);
+    expect(message.author).toEqual({ kind: "agent", name: "Claude Code" });
+    const file = answer.groups!.files![0] as InboxSearchFileRow;
+    expect(file).toMatchObject({ type: "file", name: "relay-rate-limits.md", folder: "implementation", kind: "md", thread_id: root.id });
+    expect(marked(file.name, file.name_marks)).toEqual(["rate", "lim"]);
+    expect(answer.groups!.decisions).toHaveLength(1);
+    expect(answer.totals).toEqual({ threads: 1, messages: 1, files: 1, decisions: 1, projects: 0 });
+    expect(search(index, "plannotator").groups!.projects!.map((p) => p.id)).toEqual([relay.id]);
+  });
+
+  test("a thread whose messages match is listed under Threads only when its own title fields match", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const root = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Orders endpoint", body: "Cursor pagination with opaque cursors." }).message;
+    const index = await built(store);
+    const answer = search(index, "pagination");
+    expect(threadIds(answer)).toEqual([]);
+    expect(messageIds(answer)).toEqual([root.id]);
+  });
+
+  test("the person's reply is a message from You; the Inbox's own notes are not indexed", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const root = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Retry storm", body: `Phones reconnect at once.${ASK("Add jitter?", ["Yes", "No"])}` }).message;
+    const q = store.questionsOf(root.id)[0]!;
+    store.savePicks(root.id, [{ key: q.key, revision: 0, answer: { v: 1, key: q.key, kind: q.kind, prompt: q.prompt, selected: ["Yes"] } as never }]);
+    const reply = store.sendReply(root.id, { idempotency_key: "k1", words: "Spread the first retry over five seconds.", questions: [{ key: q.key, revision: 1 }] }).reply;
+    const index = await built(store);
+    const answer = search(index, "spread retry");
+    const row = answer.groups!.messages!.find((m) => m.id === reply.id) as InboxSearchMessageRow;
+    expect(row.author).toEqual({ kind: "me", name: "You" });
+    // The generated line is not the person's words.
+    expect(messageIds(search(index, "answered"))).toEqual([]);
+    // The answer is indexed on the question (the agent's message).
+    expect(messageIds(search(index, "jitter yes"))).toEqual([root.id]);
+  });
+
+  test("Show all: one group from an offset; totals stay whole", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    for (let i = 0; i < 23; i++) store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Deploy ${i}`, thread: `t${i}`, body: `The deploy number ${i} went out.` });
+    const index = await built(store);
+    const first = search(index, "deploy");
+    expect(first.totals!.messages).toBe(23);
+    expect(first.groups!.messages).toHaveLength(8);
+    const all = search(index, "deploy", { group: "messages", offset: 8, limit: 50 });
+    expect(Object.keys(all.groups!)).toEqual(["messages"]);
+    expect(all.groups!.messages).toHaveLength(15);
+    expect(new Set([...messageIds(first), ...messageIds(all)]).size).toBe(23);
+  });
+
+  test("an empty query answers the threads looked at, by how far the person has looked (person_seen_seq); filters with no words list threads newest first", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const ids: string[] = [];
+    for (let i = 0; i < 8; i++) ids.push(store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Thread ${i}`, thread: `t${i}`, body: "x y" }).message.id);
+    for (const id of [ids[2]!, ids[5]!, ids[0]!]) store.markSeen(id);
+    const index = await built(store);
+    const empty = search(index, "");
+    expect(empty.groups).toBeNull();
+    // person_seen_seq is the seq the look covered (the brief's "no new storage"): the newer thread first.
+    expect(empty.recent!.map((r) => r.id)).toEqual([ids[5], ids[2], ids[0]]);
+    const browse = search(index, "", { project: project.id });
+    expect(browse.groups!.threads!.map((r) => r.id)).toEqual([...ids].reverse());
+    expect(browse.recent).toBeNull();
+  });
+});
+
+describe("ranking", () => {
+  test("phrase over whole words over a prefix; inside a tier the title fields first", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const prefix = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Notes", thread: "a", body: "The limits of the rate card." }).message;
+    const whole = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Notes", thread: "b", body: "A limit on the rate of retries." }).message;
+    const phrase = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Notes", thread: "c", body: "The rate limit holds." }).message;
+    const index = await built(store);
+    expect(messageIds(search(index, "rate limit"))).toEqual([phrase.id, whole.id, prefix.id]);
+    // Title before body inside a tier: a thread whose subject holds both words leads the Threads group.
+    store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Rate limit decided", thread: "d", body: "Nothing here." });
+    expect(search(index, "rate limit").groups!.threads!.map((t) => t.title)).toEqual(["Rate limit decided"]);
+  });
+
+  test("open before archived of the same quality; archived rows carry the label", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const old = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Pagination for orders", thread: "a", body: "Cursor pagination." }).message;
+    const archived = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Pagination for invoices", thread: "b", body: "Cursor pagination." }).message;
+    store.resolveThread(archived.id, true);
+    const index = await built(store);
+    const answer = search(index, "pagination");
+    // The archived thread is newer, yet ranks after the open one.
+    expect(threadIds(answer)).toEqual([old.id, archived.id]);
+    expect(answer.groups!.threads!.map((t) => (t as InboxSearchThreadRow).archived)).toEqual([false, true]);
+    expect(answer.groups!.messages!.map((m) => (m as InboxSearchMessageRow).archived)).toEqual([false, true]);
+  });
+
+  test("the current project wins ties only, never a better match, and is never a filter", async () => {
+    const store = open();
+    const a = store.ensureProject({ name: "alpha", root: "/w/alpha" });
+    const b = store.ensureProject({ name: "beta", root: "/w/beta" });
+    const inA = store.sendMessage({ project_id: a.id, author: CLAUDE, subject: "Notes", thread: "a", body: "The retry budget." }).message;
+    const inB = store.sendMessage({ project_id: b.id, author: CLAUDE, subject: "Notes", thread: "b", body: "The retry budget." }).message;
+    const better = store.sendMessage({ project_id: b.id, author: CLAUDE, subject: "Notes", thread: "c", body: "The budget retry." }).message;
+    const index = await built(store);
+    // Newest first without a boost.
+    expect(messageIds(search(index, "retry budget"))).toEqual([inB.id, inA.id, better.id]);
+    // Alpha's equal match moves above beta's; the phrase still beats the plain match; nothing is hidden.
+    expect(messageIds(search(index, "retry budget", { current: a.id }))).toEqual([inA.id, inB.id, better.id]);
+  });
+});
+
+describe("filters", () => {
+  async function world() {
+    const store = open();
+    const api = store.ensureProject({ name: "api", root: "/w/api" });
+    const web = store.ensureProject({ name: "web", root: "/w/web" });
+    const waiting = store.sendMessage({ project_id: api.id, author: CLAUDE, subject: "Deploy order", thread: "a", body: `Deploy order?${ASK("Relay first?", ["Yes", "No"])}` }).message;
+    const sent = store.sendMessage({ project_id: web.id, author: PI, subject: "Deploy preview", thread: "b", body: "The deploy preview is up." }).message;
+    const sentReply = store.sendReply(sent.id, { idempotency_key: "k", words: "Thanks, deploy it." }).reply;
+    const quiet = store.sendMessage({ project_id: api.id, author: CLAUDE, subject: "Deploy log", thread: "c", body: "The deploy log is attached." }).message;
+    store.markSeen(quiet.id);
+    const fresh = store.sendMessage({ project_id: web.id, author: CLAUDE, subject: "Deploy finished", thread: "d", body: "The deploy finished." }).message;
+    const archived = store.sendMessage({ project_id: api.id, author: CLAUDE, subject: "Deploy rollback", thread: "e", body: "We rolled the deploy back." }).message;
+    store.resolveThread(archived.id, true);
+    decision(store, api.id, "Deploy the relay by hand", { kind: "agent" });
+    decision(store, api.id, "Deploy order: relay first", { kind: "answer", threadId: waiting.id });
+    const index = await built(store);
+    return { store, index, api, web, waiting, sent, sentReply, quiet, fresh, archived };
+  }
+
+  test("status follows the thread's section; Archived means resolved; other statuses leave archived threads out", async () => {
+    const w = await world();
+    expect(threadIds(search(w.index, "deploy", { status: "waiting" }))).toEqual([w.waiting.id]);
+    expect(threadIds(search(w.index, "deploy", { status: "sent" }))).toEqual([w.sent.id]);
+    expect(threadIds(search(w.index, "deploy", { status: "new" }))).toEqual([w.fresh.id]);
+    expect(threadIds(search(w.index, "deploy", { status: "quiet" }))).toEqual([w.quiet.id]);
+    expect(threadIds(search(w.index, "deploy", { status: "archived" }))).toEqual([w.archived.id]);
+    // A decision follows its thread's section; one recorded from no thread is left out by any status.
+    expect(search(w.index, "deploy", { status: "waiting" }).groups!.decisions!.map((d) => d.type === "decision" && d.text)).toEqual(["Deploy order: relay first"]);
+    expect(search(w.index, "deploy", { status: "quiet" }).groups!.decisions).toEqual([]);
+    // Projects have no section: any status hides them.
+    expect(search(w.index, "api", { status: "quiet" }).groups!.projects).toEqual([]);
+  });
+
+  test("project and from", async () => {
+    const w = await world();
+    expect(threadIds(search(w.index, "deploy", { project: w.web.id })).sort()).toEqual([w.fresh.id, w.sent.id].sort());
+    expect(messageIds(search(w.index, "deploy", { from: "me" }))).toEqual([w.sentReply.id]);
+    const agents = search(w.index, "deploy", { from: "agent" });
+    expect(messageIds(agents)).not.toContain(w.sentReply.id);
+    // A decision recorded from the person's answer counts as Me; an agent's as Agents.
+    expect(search(w.index, "deploy", { from: "me" }).groups!.decisions!.map((d) => d.type === "decision" && d.text)).toEqual(["Deploy order: relay first"]);
+    expect(agents.groups!.decisions!.map((d) => d.type === "decision" && d.text)).toEqual(["Deploy the relay by hand"]);
+    // A thread counts for Me when the person wrote in it.
+    expect(threadIds(search(w.index, "deploy", { from: "me" }))).toEqual([w.sent.id]);
+  });
+});
+
+describe("text in every script", () => {
+  test("Japanese without spaces, Arabic as written, accents folded; marks in the original", async () => {
+    const store = open();
+    const ja = store.ensureProject({ name: "決済サービス", root: "/w/ja" });
+    const ar = store.ensureProject({ name: "بوابة-الدفع", root: "/w/ar" });
+    const jaThread = store.sendMessage({ project_id: ja.id, author: CLAUDE, subject: "デプロイ後の決済エラーの調査", body: "昨夜の deploy の後、決済APIのタイムアウトが3倍に増えました。" }).message;
+    const arThread = store.sendMessage({ project_id: ar.id, author: CLAUDE, subject: "تقرير أخطاء الدفع", body: "فشل النشر على الخادم الثاني بسبب مهلة الاتصال." }).message;
+    const fr = store.sendMessage({ project_id: ar.id, author: CLAUDE, subject: "Résumé of the café visit", thread: "fr", body: "Naïve résumé." }).message;
+    const index = await built(store);
+    expect(threadIds(search(index, "決済"))).toEqual([jaThread.id]);
+    expect(messageIds(search(index, "タイムアウト"))).toEqual([jaThread.id]);
+    expect(threadIds(search(index, "أخطاء"))).toEqual([arThread.id]);
+    const answer = search(index, "resume cafe");
+    expect(threadIds(answer)).toEqual([fr.id]);
+    const row = answer.groups!.threads![0] as InboxSearchThreadRow;
+    expect(marked(row.title, row.title_marks)).toEqual(["Résumé", "café"]);
+    expect(search(index, "決済サービス").groups!.projects!.map((p) => p.id)).toEqual([ja.id]);
+  });
+
+  test("two projects with one name are told apart by their parent folder", async () => {
+    const store = open();
+    store.ensureProject({ name: "api", root: "/home/me/work/api" });
+    store.ensureProject({ name: "api", root: "/home/me/personal/api" });
+    const index = await built(store);
+    expect(search(index, "api").groups!.projects!.map((p) => p.type === "project" && p.name).sort()).toEqual(["api · personal", "api · work"]);
+  });
+});
+
+describe("the index follows the store", () => {
+  test("a new message, a pick, an archive, a decision and a deletion show in the next search", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const index = await built(store);
+    expect(search(index, "jitter").totals!.messages).toBe(0);
+    const root = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Retry storm", body: `Phones reconnect.${ASK("Spread retries?", ["With jitter", "Without"])}` }).message;
+    expect(messageIds(search(index, "jitter"))).toEqual([root.id]);
+    // A pick makes the answer searchable on the question.
+    const q = store.questionsOf(root.id)[0]!;
+    store.savePicks(root.id, [{ key: q.key, revision: 0, answer: { v: 1, key: q.key, kind: q.kind, prompt: q.prompt, selected: [], text: "spread over five seconds" } as never }]);
+    expect(messageIds(search(index, "five seconds"))).toEqual([root.id]);
+    // Archive: the label follows, and Status follows.
+    expect(threadIds(search(index, "retry storm", { status: "archived" }))).toEqual([]);
+    store.resolveThread(root.id, true);
+    const archived = search(index, "retry storm");
+    expect((archived.groups!.threads![0] as InboxSearchThreadRow).archived).toBe(true);
+    expect(threadIds(search(index, "retry storm", { status: "archived" }))).toEqual([root.id]);
+    decision(store, project.id, "Retries spread with jitter");
+    expect(search(index, "jitter").totals!.decisions).toBe(1);
+    // A deletion re-reads the store: the index notices and rebuilds.
+    store.deleteThread(root.id);
+    expect(index.ready()).toBe(false);
+    await index.ensureBuilt();
+    expect(search(index, "retry storm").totals).toMatchObject({ threads: 0, messages: 0 });
+    expect(search(index, "jitter").totals!.decisions).toBe(1);
+  });
+
+  test("a subject derived from a question follows its replacement", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const root = store.sendMessage({ project_id: project.id, author: CLAUDE, body: ASK("Which queue backend?", ["Redis", "SQS"]).trim() }).message;
+    const index = await built(store);
+    expect(threadIds(search(index, "queue backend"))).toEqual([root.id]);
+    const q = store.questionsOf(root.id)[0]!;
+    store.sendMessage({ project_id: project.id, author: CLAUDE, reply_to: root.id, body: ASK("Which broker for the outbox?", ["Kafka", "NATS"]).trim(), supersedes: [`${root.id}/${q.key}`] });
+    expect(threadIds(search(index, "broker outbox"))).toEqual([root.id]);
+    expect(threadIds(search(index, "queue backend"))).toEqual([]);
+  });
+
+  test("the build runs in slices that yield, and a search and a write during the build are both answered", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    for (let i = 0; i < 300; i++) store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Thread ${i}`, thread: `t${i}`, body: `Message ${i} about the relay.` });
+    let yields = 0;
+    let fake = 0;
+    // A clock that moves 1 ms per read: every 2 ms of "work" is a slice.
+    const index = new InboxSearchIndex(store, { sliceMs: 2, now: () => fake++, yieldNow: () => new Promise((r) => setImmediate(() => { yields += 1; r(); })) });
+    const first = index.ensureBuilt();
+    const second = index.ensureBuilt();
+    expect(second).toBe(first);
+    // A write lands while the build is under way.
+    await new Promise((r) => setImmediate(r));
+    const late = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Late arrival", thread: "late", body: "Written during the build." }).message;
+    await first;
+    expect(yields).toBeGreaterThan(10);
+    expect(index.lastBuildStats()!.slices).toBeGreaterThan(10);
+    expect(threadIds(search(index, "late arrival"))).toEqual([late.id]);
+    expect(search(index, "relay").totals!.messages).toBe(300);
+  });
+
+  test("a deletion during a build voids it; the next build is current", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const ids: string[] = [];
+    for (let i = 0; i < 50; i++) ids.push(store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Thread ${i}`, thread: `t${i}`, body: "Relay notes." }).message.id);
+    let fake = 0;
+    const index = new InboxSearchIndex(store, { sliceMs: 1, now: () => fake++ });
+    const building = index.ensureBuilt();
+    store.deleteThread(ids[0]!);
+    await building;
+    await index.ensureBuilt();
+    expect(index.ready()).toBe(true);
+    expect(search(index, "relay").totals!.messages).toBe(49);
+  });
+});
+
