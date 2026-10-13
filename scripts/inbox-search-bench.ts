@@ -102,11 +102,11 @@ export function seedInboxSearchWorld(dataDir: string, shape: SeedShape = WORST_C
     if (r < 0.45) return `msg_${chars(B32, 26)}`;
     if (r < 0.6) return `${chars(HEX, 8)}-${chars(HEX, 4)}-${chars(HEX, 4)}-${chars(HEX, 4)}-${chars(HEX, 12)}`;
     if (r < 0.75) return String(1_700_000_000_000 + serial * 7919 + Math.floor(random() * 1000));
-    if (r < 0.85) return `2026-10-${String(1 + Math.floor(random() * 28)).padStart(2, "0")}T${String(Math.floor(random() * 24)).padStart(2, "0")}:${chars("012345", 1)}${chars("0123456789", 1)}:${chars("012345", 1)}${chars("0123456789", 1)}.${chars("0123456789", 3)}Z`;
-    return `/tmp/run-${chars(LOWER + "0123456789", 8)}/out-${chars(LOWER, 6)}.log`;
+    if (r < 0.85) return new Date(Date.UTC(2026, 9, 1) + Math.floor(random() * 28 * 86_400_000)).toISOString();
+    return "/tmp/run-" + chars(LOWER + "0123456789", 8) + "/out-" + chars(LOWER, 6) + ".log";
   };
   const word = (): string => {
-    if (unique.share > 0 && random() < unique.share) return uniqueToken();
+    if (unique.share > 0 && unique.share > random()) return uniqueToken();
     const r = random();
     if (r < 0.45) return pick(COMMON);
     if (r < 0.7) return topical[zipf(topical.length)]!;
