@@ -735,7 +735,18 @@ export class InboxSearchIndex {
     const letter = /[a-z]/.test(term);
     const bucket = letter ? this.vocab.prefixBucketOf(fnvString(term.slice(0, ID_PREFIX_LENGTH))) : this.vocab.numberBucketOf(hash);
     if (bucket < 0) return null;
-    return { bucket, high: Math.floor(hash / ID_BUCKETS), hashBits: hash >>> 11, chars: Uint8Array.from(term.slice(0, ID_PREFIX_KEEP), (c) => c.charCodeAt(0)), length: term.length, bit, last };
+    return {
+      bucket,
+      high: Math.floor(hash / ID_BUCKETS),
+      hashBits: hash >>> 11,
+      chars: Uint8Array.from(term.slice(0, ID_PREFIX_KEEP), (c) => c.charCodeAt(0)),
+      length: term.length,
+      term,
+      // A number, or an id longer than the 12 characters kept, is told apart by hash bits only.
+      hashOnly: !letter || term.length > ID_PREFIX_KEEP,
+      bit,
+      last,
+    };
   }
 
   /** `termOf` sized for every id, the bucket flag on the ids added since the last query. */
@@ -886,8 +897,25 @@ export class InboxSearchIndex {
         const found = scanDocument(doc.tokens, doc.titleLen, termOf, lastExact, lastBit, all, withIds ? ids : null);
         if (found < 0) continue;
         // The last term only as the start of an id, longer than the 12 characters kept: the text decides.
-        if ((found & 8) !== 0 && prefixNeedsText && !this.textHasPrefix(doc, last)) continue;
-        out.push({ doc: d, tier: found & 3, title: (found & 4) !== 0 });
+        if ((found & 8) !== 0 && prefixNeedsText && !this.textHasToken(doc, last, false)) continue;
+        let tier = found & 3;
+        // An id told apart by hash bits only matched them (a number, an id longer than 12 characters; rare unless it is
+        // there): the text confirms the exact token. A last term whose whole value is not there may still start an id.
+        const hashOnly = found >> 8;
+        if (hashOnly !== 0) {
+          let holds = true;
+          for (const w of ids.whole) {
+            if ((w.bit & hashOnly) === 0 || this.textHasToken(doc, w.term, true)) continue;
+            if (w.last && canPrefixId(last) && this.textHasToken(doc, last, false)) {
+              tier = 1;
+              continue;
+            }
+            holds = false;
+            break;
+          }
+          if (!holds) continue;
+        }
+        out.push({ doc: d, tier, title: (found & 4) !== 0 });
       }
       return out;
     } finally {
@@ -895,13 +923,14 @@ export class InboxSearchIndex {
     }
   }
 
-  /** Whether a token in the document's text starts with `prefix` (an id prefix longer than the 12 characters kept). */
-  private textHasPrefix(doc: Doc, prefix: string): boolean {
-    for (const text of this.docTexts(doc)) {
-      // Ids are ASCII: a text without the prefix anywhere cannot hold a token starting with it.
-      if (!text || !text.toLowerCase().includes(prefix)) continue;
-      for (const { token } of tokenizeInboxSearchText(text)) if (token.startsWith(prefix)) return true;
-    }
+  /**
+   * Whether the document's text holds the ASCII id `term` as a whole token
+   * (`whole`), or a token starting with it: read only for a document whose
+   * kept hash bits or characters already matched.
+   */
+  private textHasToken(doc: Doc, term: string, whole: boolean): boolean {
+    const pattern = tokenPattern(term, whole);
+    for (const text of this.docTexts(doc)) if (text && pattern.test(text)) return true;
     return false;
   }
 
@@ -1213,6 +1242,9 @@ interface WholeIdTerm {
   /** The term's first (up to 12) characters, and its length. */
   chars: Uint8Array;
   length: number;
+  term: string;
+  /** Matched by hash bits only (a number, an id longer than 12 characters): the text confirms it. */
+  hashOnly: boolean;
   bit: number;
   last: boolean;
 }
@@ -1233,7 +1265,7 @@ interface IdQuery {
 }
 
 /** What `readIdTail` found: the terms the id matched, and how. */
-const tail = { bits: 0, wholeLast: false, prefix: false };
+const tail = { bits: 0, wholeLast: false, prefix: false, hashOnly: 0 };
 
 /**
  * Read an id's tail at `p` (`ID_TAIL_*`), compare it with the query's id
@@ -1262,6 +1294,7 @@ function readIdTail(bytes: Uint8Array, p: number, id: number, ids: IdQuery | nul
   tail.bits = 0;
   tail.wholeLast = false;
   tail.prefix = false;
+  tail.hashOnly = 0;
   if (ids) {
     for (const w of ids.whole) {
       if (w.bucket !== id) continue;
@@ -1274,6 +1307,7 @@ function readIdTail(bytes: Uint8Array, p: number, id: number, ids: IdQuery | nul
             : w.length > ID_PREFIX_KEEP && (high >>> 0) === w.hashBits && sameBytes(bytes, at, w.chars, ID_PREFIX_KEEP);
       if (!same) continue;
       tail.bits |= w.bit;
+      if (w.hashOnly) tail.hashOnly |= w.bit;
       if (w.last) tail.wholeLast = true;
     }
     const prefix = ids.prefix;
@@ -1317,7 +1351,8 @@ function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Uint16Array): bo
  * found without looking ahead. Returns -1 when a term is missing, else the
  * tier (3 phrase, 2 every term whole, 1 the last as a prefix), plus 4 when
  * the title fields hold every term, plus 8 when the last term matched only as
- * the start of an id.
+ * the start of an id, plus the bits of the id terms matched by hash bits only
+ * shifted left by 8 (the text confirms those).
  */
 function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint16Array, lastExact: number, lastBit: number, all: number, ids: IdQuery | null): number {
   const length = bytes.length;
@@ -1327,6 +1362,7 @@ function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint16Array, 
   let phrase = false;
   let lastOther = false;
   let lastAsIdPrefix = false;
+  let hashOnly = 0;
   let run = 0;
   let p = 0;
   let t = 0;
@@ -1352,6 +1388,7 @@ function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint16Array, 
           lastOther = true;
         }
         if (tail.prefix) lastAsIdPrefix = true;
+        hashOnly |= tail.hashOnly;
       } else {
         if (id === lastExact) whole = true;
         if ((m & lastBit) !== 0) lastOther = true;
@@ -1367,7 +1404,17 @@ function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint16Array, 
     if (phrase && whole && t >= titleLen && seen === all) break;
   }
   if (seen !== all) return -1;
-  return (phrase ? 3 : whole ? 2 : 1) | (seenTitle === all ? 4 : 0) | (!lastOther && lastAsIdPrefix ? 8 : 0);
+  return (phrase ? 3 : whole ? 2 : 1) | (seenTitle === all ? 4 : 0) | (!lastOther && lastAsIdPrefix ? 8 : 0) | (hashOnly << 8);
+}
+
+/**
+ * An ASCII term as a token in text, case-insensitive: a whole token
+ * (`whole`), else a token's start. Tokens end at anything but an ASCII letter
+ * or digit, as the tokenizer's ASCII scan does.
+ */
+function tokenPattern(term: string, whole: boolean): RegExp {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![A-Za-z0-9])${escaped}${whole ? "(?![A-Za-z0-9])" : ""}`, "i");
 }
 
 /** A body longer than this is read only around its first hit when a row is drawn. */
@@ -1376,17 +1423,20 @@ const ROW_TEXT_WINDOW_SIDE = 4096;
 
 /**
  * The part of a long message body a row needs: the whole lines about 4 KB
- * either side of the first place a term appears (case-insensitive), so a row
- * for a 2 MB log costs what one for a short message does. The whole body when
- * it is short, when a term is not plain ASCII (folding can match it in ways a
- * case-insensitive search cannot), or when no term is found as written.
+ * either side of the first place a term appears as a token (case-insensitive;
+ * the last term as a token's start, so `re` centres on `retry`, not `there`),
+ * so a row for a 2 MB log costs what one for a short message does. The whole
+ * body when it is short, when a term is not plain ASCII (folding can match it
+ * in ways a case-insensitive search cannot), or when no term is found as
+ * written.
  */
 function nearFirstHit(body: string, terms: readonly string[]): string {
   if (body.length <= ROW_TEXT_WINDOW_FROM) return body;
   let first = -1;
-  for (const term of terms) {
+  for (let i = 0; i < terms.length; i++) {
+    const term = terms[i]!;
     if (!/^[\x20-\x7e]+$/.test(term)) return body;
-    const at = body.search(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    const at = body.search(tokenPattern(term, i < terms.length - 1));
     if (at >= 0 && (first < 0 || at < first)) first = at;
   }
   if (first < 0) return body;
