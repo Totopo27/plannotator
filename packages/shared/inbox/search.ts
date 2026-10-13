@@ -61,7 +61,7 @@ import {
   type InboxSectionId,
 } from "@plannotator/core/inbox-types";
 import { inboxRowArchived } from "./list";
-import { isIdLikeToken, Postings, Vocabulary } from "./search-vocabulary";
+import { canPrefixId, fnvString, ID_BUCKETS, ID_PREFIX_KEEP, ID_PREFIX_LENGTH, isIdLikeToken, Postings, Vocabulary } from "./search-vocabulary";
 import type { InboxStore } from "./store";
 
 // The wire (answers, rows, the query) is @plannotator/core/inbox-search's, so the window reads it without this package.
@@ -320,8 +320,14 @@ export class InboxSearchIndex {
   // Query scratch, reused.
   private mark = new Int32Array(0);
   private epoch = 0;
-  /** Per id, the query terms it matches as bits (a query has at most 8 terms). */
-  private termOf = new Uint8Array(0);
+  /**
+   * Per id, the query terms it matches as bits (a query has at most 8 terms),
+   * and `BUCKET_FLAG` kept on every id bucket: in a document's tokens a bucket
+   * id is followed by the id's two hashes (`put`).
+   */
+  private termOf = new Uint16Array(0);
+  /** Ids below this carry their `BUCKET_FLAG`. */
+  private termFlagged = 0;
   private seq = new Bytes(4096);
 
   constructor(store: InboxStore, options: InboxSearchIndexOptions = {}) {
@@ -414,6 +420,8 @@ export class InboxSearchIndex {
     this.dead = 0;
     this.vocab = new Vocabulary();
     this.postings = new Postings();
+    this.termOf = new Uint16Array(0);
+    this.termFlagged = 0;
     this.facts = new Map();
     this.projectNames = new Map();
   }
@@ -553,6 +561,17 @@ export class InboxSearchIndex {
       count += 1;
       lastWasToken = true;
       postings.add(id, number);
+      if (vocab.lastWasId) {
+        // An id: what confirms it, or a start of it, without the text (`ID_TAIL_*`). A number's bucket holds the low
+        // bits of its hash and its tail the rest; an id with a letter keeps its first 12 characters, whole when it is
+        // no longer, else with 21 bits of its whole hash.
+        const keep = vocab.lastPrefixLength;
+        const complete = keep > 0 && vocab.lastIdLength === keep;
+        seq.push(keep | (complete ? ID_TAIL_COMPLETE : 0));
+        if (keep === 0) seq.push(Math.floor(vocab.lastHash / ID_BUCKETS));
+        else if (!complete) seq.push(vocab.lastHash >>> 11);
+        for (let k = 0; k < keep; k++) seq.push(vocab.lastPrefix[k]!);
+      }
     };
     const visit = (token: string) => add(vocab.idOfToken(token));
     let current = "";
@@ -591,7 +610,7 @@ export class InboxSearchIndex {
   indexBytes(): number {
     let docs = 0;
     for (const doc of this.docs) docs += doc ? 160 + doc.tokens.byteLength + doc.key.length * 2 + doc.sig.length * 2 : 8;
-    return this.vocab.bytes() + this.postings.bytes() + docs;
+    return this.vocab.bytes() + this.postings.bytes() + this.termOf.byteLength + docs;
   }
 
   private remove(key: string): void {
@@ -710,29 +729,92 @@ export class InboxSearchIndex {
     return this.epoch;
   }
 
-  /** Documents holding every term (the last as a prefix), with their tier and whether the title fields hold them all. */
+  /** An id-like term matched by its whole value: its bucket and what each tail shape compares (null: no id has its bucket). */
+  private wholeIdTerm(term: string, bit: number, last: boolean): WholeIdTerm | null {
+    const hash = fnvString(term);
+    const letter = /[a-z]/.test(term);
+    const bucket = letter ? this.vocab.prefixBucketOf(fnvString(term.slice(0, ID_PREFIX_LENGTH))) : this.vocab.numberBucketOf(hash);
+    if (bucket < 0) return null;
+    return { bucket, high: Math.floor(hash / ID_BUCKETS), hashBits: hash >>> 11, chars: Uint8Array.from(term.slice(0, ID_PREFIX_KEEP), (c) => c.charCodeAt(0)), length: term.length, bit, last };
+  }
+
+  /** `termOf` sized for every id, the bucket flag on the ids added since the last query. */
+  private prepareTermOf(): Uint16Array {
+    const size = this.vocab.size;
+    if (this.termOf.length < size) {
+      const grown = new Uint16Array(Math.max(Math.ceil(size * 1.25), 1024));
+      grown.set(this.termOf);
+      this.termOf = grown;
+    }
+    for (let id = this.termFlagged; id < size; id++) if (this.vocab.isBucket(id)) this.termOf[id] = BUCKET_FLAG;
+    this.termFlagged = size;
+    return this.termOf;
+  }
+
+  /**
+   * Documents holding every term (the last as a prefix), with their tier and
+   * whether the title fields hold them all. An id-like term is matched by its
+   * whole value through its bucket, confirmed by the 32-bit hash kept beside
+   * each occurrence; a last term that may start an id (`canPrefixId`, at least
+   * 7 characters with a letter) also matches ids that start with it, compared
+   * with the first 12 characters kept beside each id, and when it is longer
+   * than 12, the rest is read from those documents' text.
+   */
   private match(terms: readonly string[]): { doc: number; tier: number; title: boolean }[] {
     const n = terms.length;
+    const vocab = this.vocab;
     const exactIds: number[] = [];
+    const ids: IdQuery = { whole: [], prefix: null, prefixBit: 0 };
     for (let i = 0; i < n - 1; i++) {
-      const id = this.vocab.idOf(terms[i]!);
+      const term = terms[i]!;
+      if (isIdLikeToken(term)) {
+        const spec = this.wholeIdTerm(term, 1 << i, false);
+        if (!spec) return [];
+        exactIds.push(spec.bucket);
+        ids.whole.push(spec);
+        continue;
+      }
+      const id = vocab.idOf(term);
       if (id < 0) return [];
       exactIds.push(id);
     }
     const last = terms[n - 1]!;
-    const lastExact = this.vocab.idOf(last);
-    const prefix = this.vocab.prefixIds(last);
-    if (prefix.length === 0) return [];
+    const lastBit = 1 << (n - 1);
+    const lastIdLike = isIdLikeToken(last);
+    const lastExact = lastIdLike ? -1 : vocab.idOf(last);
+    // The words the last term starts, then the buckets that may hold it as an id.
+    const prefix = vocab.prefixIds(last);
+    const sources = [...prefix];
+    if (lastIdLike) {
+      const spec = this.wholeIdTerm(last, lastBit, true);
+      if (spec) {
+        sources.push(spec.bucket);
+        ids.whole.push(spec);
+      }
+    }
+    let prefixNeedsText = false;
+    if (canPrefixId(last)) {
+      const bucket = vocab.prefixBucketOf(fnvString(last.slice(0, ID_PREFIX_LENGTH)));
+      if (bucket >= 0) {
+        // An id-like last term with a letter is already there: its whole value and its starts share one bucket.
+        if (!sources.includes(bucket)) sources.push(bucket);
+        ids.prefix = Uint8Array.from(last.slice(0, ID_PREFIX_KEEP), (c) => c.charCodeAt(0));
+        ids.prefixBit = lastBit;
+        prefixNeedsText = last.length > ID_PREFIX_KEEP;
+      }
+    }
+    if (sources.length === 0) return [];
+    const withIds = ids.whole.length > 0 || ids.prefixBit !== 0;
 
-    if (this.termOf.length < this.vocab.size) this.termOf = new Uint8Array(Math.max(Math.ceil(this.vocab.size * 1.25), 1024));
-    const termOf = this.termOf;
+    const termOf = this.prepareTermOf();
     const touched: number[] = [];
     const flag = (id: number, bit: number) => {
+      if ((termOf[id]! & BUCKET_FLAG) !== 0) return;
       if (termOf[id] === 0) touched.push(id);
       termOf[id]! |= bit;
     };
     exactIds.forEach((id, i) => flag(id, 1 << i));
-    for (const id of prefix) flag(id, 1 << (n - 1));
+    for (const id of prefix) flag(id, lastBit);
 
     try {
       let candidates: Int32Array;
@@ -753,12 +835,12 @@ export class InboxSearchIndex {
           candidates = candidates.subarray(0, k);
           if (candidates.length === 0) return [];
         }
-        // The last term as a prefix: mark its documents, unless they far outnumber the candidates (then each is scanned below anyway).
-        let prefixPostings = 0;
-        for (const id of prefix) prefixPostings += this.postings.count(id);
-        if (prefixPostings <= candidates.length * 32) {
+        // The last term: mark its documents, unless they far outnumber the candidates (then each is scanned below anyway).
+        let sourcePostings = 0;
+        for (const id of sources) sourcePostings += this.postings.count(id);
+        if (sourcePostings <= candidates.length * 32) {
           const epoch = this.nextEpoch();
-          for (const id of prefix) {
+          for (const id of sources) {
             const list = this.postingsOf(id);
             for (let i = 0; i < list.length; i++) this.mark[list[i]!] = epoch;
           }
@@ -769,10 +851,10 @@ export class InboxSearchIndex {
       } else {
         const epoch = this.nextEpoch();
         let total = 0;
-        for (const id of prefix) total += this.postings.count(id);
+        for (const id of sources) total += this.postings.count(id);
         const out = new Int32Array(total);
         let k = 0;
-        for (const id of prefix) {
+        for (const id of sources) {
           const list = this.postingsOf(id);
           for (let i = 0; i < list.length; i++) {
             const d = list[i]!;
@@ -785,28 +867,26 @@ export class InboxSearchIndex {
       }
 
       const all = (1 << n) - 1;
-      const lastBit = 1 << (n - 1);
       const out: { doc: number; tier: number; title: boolean }[] = [];
       let exactEpoch = -1;
-      if (n === 1 && lastExact >= 0) {
-        // One term: whole when the exact token is in the document.
+      if (n === 1 && !withIds && lastExact >= 0) {
+        // One word: whole when the exact token is in the document.
         exactEpoch = this.nextEpoch();
         const list = this.postingsOf(lastExact);
         for (let i = 0; i < list.length; i++) this.mark[list[i]!] = exactEpoch;
       }
-      // An id-like term matched a shared bucket: the document's own text decides.
-      const idTerms = terms.filter(isIdLikeToken);
       for (let c = 0; c < candidates.length; c++) {
         const d = candidates[c]!;
         const doc = this.docs[d]!;
-        if (idTerms.length > 0 && !this.holdsTokens(doc, idTerms)) continue;
-        if (n === 1) {
-          // The title needs only the leading tokens.
+        if (n === 1 && !withIds) {
+          // One word: every candidate holds it, and the title needs only the leading tokens.
           out.push({ doc: d, tier: exactEpoch >= 0 && this.mark[d] === exactEpoch ? 2 : 1, title: scanTitle(doc.tokens, doc.titleLen, termOf) });
           continue;
         }
-        const found = scanDocument(doc.tokens, doc.titleLen, termOf, lastExact, lastBit, all);
+        const found = scanDocument(doc.tokens, doc.titleLen, termOf, lastExact, lastBit, all, withIds ? ids : null);
         if (found < 0) continue;
+        // The last term only as the start of an id, longer than the 12 characters kept: the text decides.
+        if ((found & 8) !== 0 && prefixNeedsText && !this.textHasPrefix(doc, last)) continue;
         out.push({ doc: d, tier: found & 3, title: (found & 4) !== 0 });
       }
       return out;
@@ -815,13 +895,12 @@ export class InboxSearchIndex {
     }
   }
 
-  /** Whether the document's text holds every one of `tokens` as a whole token (the check behind an id-like term's shared bucket). */
-  private holdsTokens(doc: Doc, tokens: readonly string[]): boolean {
-    const wanted = new Set(tokens);
+  /** Whether a token in the document's text starts with `prefix` (an id prefix longer than the 12 characters kept). */
+  private textHasPrefix(doc: Doc, prefix: string): boolean {
     for (const text of this.docTexts(doc)) {
-      if (!text) continue;
-      for (const { token } of tokenizeInboxSearchText(text)) wanted.delete(token);
-      if (wanted.size === 0) return true;
+      // Ids are ASCII: a text without the prefix anywhere cannot hold a token starting with it.
+      if (!text || !text.toLowerCase().includes(prefix)) continue;
+      for (const { token } of tokenizeInboxSearchText(text)) if (token.startsWith(prefix)) return true;
     }
     return false;
   }
@@ -1080,9 +1159,9 @@ export class InboxSearchIndex {
    */
   private bestMessageText(message: InboxMessage, terms: readonly string[]): { text: string; question: { key: string; replaced: boolean } | null } {
     const candidates: { text: string; question: { key: string; replaced: boolean } | null }[] = [];
-    if (message.author.kind === "person") candidates.push({ text: inboxSearchReplyText(message.body), question: null });
+    if (message.author.kind === "person") candidates.push({ text: inboxSearchReplyText(nearFirstHit(message.body, terms)), question: null });
     else {
-      candidates.push({ text: inboxSearchBodyText(message.body), question: null });
+      candidates.push({ text: inboxSearchBodyText(nearFirstHit(message.body, terms)), question: null });
       for (const q of this.store.questionsOf(message.id)) {
         const ref = { key: q.key, replaced: q.state === "superseded" };
         const answer = answerText(q.answer);
@@ -1112,8 +1191,102 @@ export class InboxSearchIndex {
   }
 }
 
-/** Any of the first `titleLen` tokens is a term (`termOf` non-zero). */
-function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Uint8Array): boolean {
+/** `termOf`'s flag on an id bucket: its token is followed by the id's tail (`ID_TAIL_*`). */
+const BUCKET_FLAG = 0x100;
+
+/**
+ * After an id bucket's token, the id's tail: a flags byte (the number of
+ * characters kept, 0 to 12, plus `ID_TAIL_COMPLETE` when they are the whole
+ * id), then for a number (none kept) the bits of its hash above its bucket's,
+ * for an id longer than 12 characters the high 21 bits of its hash, both as
+ * varints, then the characters.
+ */
+const ID_TAIL_KEPT = 0x0f;
+const ID_TAIL_COMPLETE = 0x10;
+
+/** A whole-value id term: its bucket, and what each tail shape compares. */
+interface WholeIdTerm {
+  bucket: number;
+  /** The hash above its bucket's bits (a number's tail), and its high 21 bits (a longer id's). */
+  high: number;
+  hashBits: number;
+  /** The term's first (up to 12) characters, and its length. */
+  chars: Uint8Array;
+  length: number;
+  bit: number;
+  last: boolean;
+}
+
+/** Whether `count` bytes at `at` equal `chars`' first `count`. */
+function sameBytes(bytes: Uint8Array, at: number, chars: Uint8Array, count: number): boolean {
+  for (let k = 0; k < count; k++) if (bytes[at + k] !== chars[k]) return false;
+  return true;
+}
+
+/** A query's id-like terms (`match`). */
+interface IdQuery {
+  /** Whole values. */
+  whole: WholeIdTerm[];
+  /** The last term as the start of an id: its first (up to 12) characters and its bit (0: none). */
+  prefix: Uint8Array | null;
+  prefixBit: number;
+}
+
+/** What `readIdTail` found: the terms the id matched, and how. */
+const tail = { bits: 0, wholeLast: false, prefix: false };
+
+/**
+ * Read an id's tail at `p` (`ID_TAIL_*`), compare it with the query's id
+ * terms into `tail`, and return the position after it. Only bucket tokens
+ * come here, so the scanners' loops stay as fast as for words.
+ */
+function readIdTail(bytes: Uint8Array, p: number, id: number, ids: IdQuery | null): number {
+  const flags = bytes[p++]!;
+  const kept = flags & ID_TAIL_KEPT;
+  const complete = (flags & ID_TAIL_COMPLETE) !== 0;
+  let high = -1;
+  if (!complete) {
+    high = bytes[p++]!;
+    if (high & 0x80) {
+      high &= 0x7f;
+      let shift = 7;
+      let b: number;
+      do {
+        b = bytes[p++]!;
+        high |= (b & 0x7f) << shift;
+        shift += 7;
+      } while (b & 0x80);
+    }
+  }
+  const at = p;
+  tail.bits = 0;
+  tail.wholeLast = false;
+  tail.prefix = false;
+  if (ids) {
+    for (const w of ids.whole) {
+      if (w.bucket !== id) continue;
+      // A number by its hash; a short id by all its characters; a longer one by its first 12 and 21 bits of its hash.
+      const same =
+        kept === 0
+          ? high === w.high
+          : complete
+            ? w.length === kept && sameBytes(bytes, at, w.chars, kept)
+            : w.length > ID_PREFIX_KEEP && (high >>> 0) === w.hashBits && sameBytes(bytes, at, w.chars, ID_PREFIX_KEEP);
+      if (!same) continue;
+      tail.bits |= w.bit;
+      if (w.last) tail.wholeLast = true;
+    }
+    const prefix = ids.prefix;
+    if (prefix !== null && kept >= prefix.length && sameBytes(bytes, at, prefix, prefix.length)) {
+      tail.bits |= ids.prefixBit;
+      tail.prefix = true;
+    }
+  }
+  return at + kept;
+}
+
+/** Any of the first `titleLen` tokens is a word term (one word, no id terms). */
+function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Uint16Array): boolean {
   let p = 0;
   for (let t = 0; t < titleLen; t++) {
     let id = bytes[p++]!;
@@ -1127,25 +1300,33 @@ function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Uint8Array): boo
         shift += 7;
       } while (b & 0x80);
     }
-    if (termOf[id] !== 0) return true;
+    const m = termOf[id]!;
+    if (m === 0) continue;
+    if (m >= BUCKET_FLAG) p = readIdTail(bytes, p, id, null);
+    else return true;
   }
   return false;
 }
 
 /**
  * One pass over a document's tokens for several terms. `termOf[id]` holds,
- * as bits, the terms a token matches (the last term's bit on every token it
- * prefixes). `run` holds which prefixes of the query end at the current
- * token, so a phrase is found without looking ahead. Returns -1 when a term
- * is missing, else the tier (3 phrase, 2 every term whole, 1 the last as a
- * prefix) plus 4 when the title fields hold every term.
+ * as bits, the terms a word matches (the last term's bit on every word it
+ * prefixes); an id bucket's bits come from comparing the hash bits and the
+ * first characters after it with the query's (`ids`, `readIdTail`). `run`
+ * holds which prefixes of the query end at the current token, so a phrase is
+ * found without looking ahead. Returns -1 when a term is missing, else the
+ * tier (3 phrase, 2 every term whole, 1 the last as a prefix), plus 4 when
+ * the title fields hold every term, plus 8 when the last term matched only as
+ * the start of an id.
  */
-function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint8Array, lastExact: number, lastBit: number, all: number): number {
+function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint16Array, lastExact: number, lastBit: number, all: number, ids: IdQuery | null): number {
   const length = bytes.length;
   let seen = 0;
   let seenTitle = 0;
   let whole = false;
   let phrase = false;
+  let lastOther = false;
+  let lastAsIdPrefix = false;
   let run = 0;
   let p = 0;
   let t = 0;
@@ -1161,19 +1342,57 @@ function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint8Array, l
         shift += 7;
       } while (b & 0x80);
     }
-    const m = termOf[id]!;
+    let m = termOf[id]!;
+    if (m !== 0) {
+      if (m >= BUCKET_FLAG) {
+        p = readIdTail(bytes, p, id, ids);
+        m = tail.bits;
+        if (tail.wholeLast) {
+          whole = true;
+          lastOther = true;
+        }
+        if (tail.prefix) lastAsIdPrefix = true;
+      } else {
+        if (id === lastExact) whole = true;
+        if ((m & lastBit) !== 0) lastOther = true;
+      }
+    }
     run = ((run << 1) | 1) & m;
     if (m !== 0) {
       seen |= m;
       if (t < titleLen) seenTitle |= m;
-      if (id === lastExact) whole = true;
-      if ((run & lastBit) !== 0) phrase = true;
+      if ((run & lastBit) !== 0 && lastBit > 1) phrase = true;
     }
     t++;
     if (phrase && whole && t >= titleLen && seen === all) break;
   }
   if (seen !== all) return -1;
-  return (phrase ? 3 : whole ? 2 : 1) | (seenTitle === all ? 4 : 0);
+  return (phrase ? 3 : whole ? 2 : 1) | (seenTitle === all ? 4 : 0) | (!lastOther && lastAsIdPrefix ? 8 : 0);
+}
+
+/** A body longer than this is read only around its first hit when a row is drawn. */
+const ROW_TEXT_WINDOW_FROM = 64 * 1024;
+const ROW_TEXT_WINDOW_SIDE = 4096;
+
+/**
+ * The part of a long message body a row needs: the whole lines about 4 KB
+ * either side of the first place a term appears (case-insensitive), so a row
+ * for a 2 MB log costs what one for a short message does. The whole body when
+ * it is short, when a term is not plain ASCII (folding can match it in ways a
+ * case-insensitive search cannot), or when no term is found as written.
+ */
+function nearFirstHit(body: string, terms: readonly string[]): string {
+  if (body.length <= ROW_TEXT_WINDOW_FROM) return body;
+  let first = -1;
+  for (const term of terms) {
+    if (!/^[\x20-\x7e]+$/.test(term)) return body;
+    const at = body.search(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    if (at >= 0 && (first < 0 || at < first)) first = at;
+  }
+  if (first < 0) return body;
+  const start = first <= ROW_TEXT_WINDOW_SIDE ? 0 : body.lastIndexOf("\n", first - ROW_TEXT_WINDOW_SIDE) + 1;
+  const end = body.indexOf("\n", first + ROW_TEXT_WINDOW_SIDE);
+  return body.slice(start, end < 0 ? body.length : end);
 }
 
 /** The best `k` hits, best first (ties: the older document first, so the order is total). A partial selection when `k` is small. */
