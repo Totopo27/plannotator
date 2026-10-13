@@ -306,6 +306,12 @@ export class Vocabulary {
     this.slots = new Int32Array(this.slots.length * 2);
   }
 
+  /** Move up to `count` more slots of a growth under way (the end of a build, a slice at a time); true once none is. */
+  settleGrowth(count: number): boolean {
+    if (this.old) this.migrate(count);
+    return this.old === null;
+  }
+
   private migrate(count: number): void {
     const old = this.old!;
     const slots = this.slots;

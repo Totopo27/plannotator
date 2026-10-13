@@ -460,7 +460,10 @@ export class InboxSearchIndex {
       this.indexDecision(decision as InboxDecision);
       if (!(await maybeYield())) return;
     }
-    // Give back the arrays' growth slack, each copy in a slice of its own.
+    // Finish a growth of the word table still under way, then give back the arrays' growth slack, each step in a slice of its own.
+    while (!this.vocab.settleGrowth(1 << 16)) {
+      if (!(await maybeYield())) return;
+    }
     for (const part of [this.vocab, this.postings]) {
       longest = Math.max(longest, this.now() - sliceStart);
       if (this.now() - sliceStart > 8) over += 1;
