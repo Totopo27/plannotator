@@ -376,7 +376,7 @@ interface FieldSet {
 }
 
 export interface InboxSearchIndexOptions {
-  /** How long a build slice works before it yields (default 6 ms: the slice that ends with a long message still stays under the brief's 8 ms). */
+  /** How long a build slice works before it yields (default 5 ms: the slice that ends with a long message, or a collection, still stays under the brief's 8 ms). */
   sliceMs?: number;
   /** Yield between slices (default setImmediate, else setTimeout 0). */
   yieldNow?: () => Promise<void>;
@@ -394,6 +394,8 @@ export interface InboxSearchBuildStats {
   vocabulary: number;
   slices: number;
   longestSliceMs: number;
+  /** Slices that ran past 8 ms (the brief's bound): a collection or a long message at the end of a slice. */
+  slicesOver8Ms: number;
   totalMs: number;
 }
 
@@ -441,11 +443,10 @@ export class InboxSearchIndex {
   private tokenMark = new Int32Array(0);
   private tokenEpoch = 0;
   private seq = new Bytes(4096);
-  private scratch: Int32Array = new Int32Array(4096);
 
   constructor(store: InboxStore, options: InboxSearchIndexOptions = {}) {
     this.store = store;
-    this.sliceMs = options.sliceMs ?? 6;
+    this.sliceMs = options.sliceMs ?? 5;
     this.yieldNow = options.yieldNow ?? defaultYield;
     this.now = options.now ?? (() => performance.now());
   }
@@ -547,6 +548,7 @@ export class InboxSearchIndex {
     let sliceStart = started;
     let slices = 1;
     let longest = 0;
+    let over = 0;
     const reloads = this.store.reloadCount();
     this.built = false;
     this.resetIndex();
@@ -560,6 +562,7 @@ export class InboxSearchIndex {
       const t = this.now();
       if (t - sliceStart < this.sliceMs) return true;
       longest = Math.max(longest, t - sliceStart);
+      if (t - sliceStart > 8) over += 1;
       await this.yieldNow();
       slices += 1;
       sliceStart = this.now();
@@ -597,6 +600,7 @@ export class InboxSearchIndex {
       vocabulary: this.words.length - 1,
       slices,
       longestSliceMs: longest,
+      slicesOver8Ms: over,
       totalMs: this.now() - started,
     };
   }
@@ -678,17 +682,23 @@ export class InboxSearchIndex {
     seq.len = 0;
     let count = 0;
     let lastWasToken = false;
-    const visit = (token: string) => {
-      seq.push(this.tokenId(token));
+    // The document's number, and each token's posting written the first time the token is seen in it.
+    const number = this.docs.length;
+    const epoch = this.nextTokenEpoch();
+    const add = (id: number) => {
+      seq.push(id);
       count += 1;
       lastWasToken = true;
+      if (id >= this.tokenMark.length) this.growTokenMark();
+      if (this.tokenMark[id] === epoch) return;
+      this.tokenMark[id] = epoch;
+      this.postBuf[id]!.push(number - this.postLast[id]!);
+      this.postLast[id] = number;
+      this.postCount[id]! += 1;
     };
+    const visit = (token: string) => add(this.tokenId(token));
     let current = "";
-    const visitSpan = (start: number, end: number, upper: boolean) => {
-      seq.push(this.spanId(current, start, end, upper));
-      count += 1;
-      lastWasToken = true;
-    };
+    const visitSpan = (start: number, end: number, upper: boolean) => add(this.spanId(current, start, end, upper));
     const scan = (text: string) => {
       current = text;
       scanInboxSearchTokens(text, visitSpan, visit);
@@ -709,31 +719,20 @@ export class InboxSearchIndex {
     const titleLen = count;
     push(fields.other);
     if (count === 0) return;
-    const number = this.docs.length;
     const tokens = seq.take();
     this.docs.push({ key, type, ref: meta.ref, threadId: meta.threadId, projectId: meta.projectId, at, from: meta.from, tokens, count, titleLen, sig });
     this.byKey.set(key, number);
-    // Each token's posting list holds a document once.
-    const decoded = decodeVarints(tokens, tokens.length, this.scratch, false);
-    this.scratch = decoded.out;
-    const epoch = this.nextTokenEpoch();
-    for (let i = 0; i < decoded.n; i++) {
-      const id = decoded.out[i]!;
-      if (id === 0 || this.tokenMark[id] === epoch) continue;
-      this.tokenMark[id] = epoch;
-      this.postBuf[id]!.push(number - this.postLast[id]!);
-      this.postLast[id] = number;
-      this.postCount[id]! += 1;
-    }
+  }
+
+  private growTokenMark(): void {
+    const grown = new Int32Array(Math.max(this.words.length * 2, 1024));
+    grown.set(this.tokenMark);
+    this.tokenMark = grown;
   }
 
   /** A fresh mark for "this token was seen in this document". */
   private nextTokenEpoch(): number {
-    if (this.tokenMark.length < this.words.length) {
-      const grown = new Int32Array(Math.max(this.words.length * 2, 1024));
-      grown.set(this.tokenMark);
-      this.tokenMark = grown;
-    }
+    if (this.tokenMark.length < this.words.length) this.growTokenMark();
     this.tokenEpoch += 1;
     if (this.tokenEpoch > 0x7ffffff0) {
       this.tokenMark.fill(0);

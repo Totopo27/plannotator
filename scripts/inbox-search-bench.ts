@@ -259,6 +259,7 @@ async function main() {
       build_wall_ms_first_search: +buildWall.toFixed(1),
       build_slices: stats.slices,
       build_longest_slice_ms: +stats.longestSliceMs.toFixed(2),
+      build_slices_over_8ms: stats.slicesOver8Ms,
       health_idle_ms: { p50: +percentile(idle, 50).toFixed(2), p95: +percentile(idle, 95).toFixed(2) },
       health_during_build_ms: { samples: health.length, p50: +percentile(health, 50).toFixed(2), p95: +percentile(health, 95).toFixed(2), max: +Math.max(...health).toFixed(2) },
       query_server_ms: { samples: took.length, p50: +percentile(took, 50).toFixed(2), p95: +percentile(took, 95).toFixed(2), max: +Math.max(...took).toFixed(2) },
