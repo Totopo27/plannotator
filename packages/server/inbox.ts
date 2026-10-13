@@ -258,7 +258,7 @@ export interface InboxServerOptions {
    * Tests give temp folders and fake CLIs.
    */
   agentEnvironment?: AgentEnvironment;
-  /** Tests: how the search index slices its build (packages/shared/inbox/search.ts). Default: 6 ms slices that yield. */
+  /** Tests: how the search index slices its build (packages/shared/inbox/search.ts). Default: 5 ms slices that yield. */
   searchIndex?: InboxSearchIndexOptions;
 }
 

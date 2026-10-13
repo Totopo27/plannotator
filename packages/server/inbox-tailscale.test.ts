@@ -249,6 +249,8 @@ describe("Inbox over your tailnet", () => {
     expect((answer.groups as { threads: { id: string }[] }).threads.map((t) => t.id)).toEqual([message.id]);
     expect(await codeOf(await throughServe(inbox, path, { login: "someone@example.com" }))).toEqual([403, "tailnet_identity_refused"]);
     expect(await codeOf(await throughServe(inbox, path, { headers: { "Sec-Fetch-Site": "cross-site" } }))).toEqual([403, "cross_site"]);
+    // Another machine of the tailnet is the same site: refused too.
+    expect(await codeOf(await throughServe(inbox, path, { headers: { "Sec-Fetch-Site": "same-site" } }))).toEqual([403, "cross_site"]);
     const origin = `https://${MAGIC}:${inbox.port}`;
     const saved = await throughServe(inbox, "/api/inbox/search/recent", {
       method: "POST",

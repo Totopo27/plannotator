@@ -9,12 +9,15 @@
  *     (target: no slice over 8 ms), and the health route's latency while it runs;
  *   - a query's server time over a mixed set (target: p95 under 25 ms),
  *     and the HTTP round trip;
- *   - index memory against the text it holds (target: under 1.5x);
+ *   - index memory against the text it holds (target: under 1.5x; with 15%
+ *     of words unique, about 2.5x at most);
  *   - a message sent after the build, found by the next search.
  *
  *   bun scripts/inbox-search-bench.ts                 # seed a temp dir, measure, remove it
  *   bun scripts/inbox-search-bench.ts --keep DIR      # seed DIR (a scratch folder), measure, keep it
  *   bun scripts/inbox-search-bench.ts --json          # the numbers as JSON on stdout
+ *   bun scripts/inbox-search-bench.ts --unique 3      # 3% of words replaced by ids seen once (hashes, ULIDs, UUIDs, timestamps, paths)
+ *   bun scripts/inbox-search-bench.ts --unique 15 --unique-words   # ... by random words seen once instead
  *
  * Only a scratch data dir is accepted (tests/helpers/real-data-dir.ts).
  */
@@ -22,6 +25,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { heapStats } from "bun:jsc";
 import { inboxId, type InboxAuthor, type InboxDecision } from "../packages/core/inbox-types";
 import type { InboxAttachment } from "../packages/core/inbox-types";
 import { InboxStore } from "../packages/shared/inbox/store";
@@ -56,7 +60,18 @@ const JAPANESE = ["決済", "サービス", "デプロイ", "エラー", "調査
 const ARABIC = ["تقرير", "أخطاء", "الدفع", "الخادم", "النشر", "مهلة", "الاتصال", "قاعدة", "البيانات"];
 const PROJECT_NAMES = ["plannotator", "workspaces", "api", "web", "billing-svc", "docs-site", "決済サービス", "بوابة-الدفع", "northwind-industries-holdings-customer-portal-frontend", "relay", "mobile", "infra"];
 
-export function seedInboxSearchWorld(dataDir: string, shape: SeedShape = WORST_CASE, seed = 1): { store: InboxStore; textChars: number; threadIds: string[] } {
+/**
+ * `unique`: the share of words replaced by a token seen nowhere else, as
+ * agents write them: `ids` mixes commit hashes, ULIDs, UUIDs, timestamps,
+ * large numbers and random file names; `words` is random lower-case words,
+ * the case no id rule can tell from a real word.
+ */
+export interface UniqueMix {
+  share: number;
+  kind: "ids" | "words";
+}
+
+export function seedInboxSearchWorld(dataDir: string, shape: SeedShape = WORST_CASE, seed = 1, unique: UniqueMix = { share: 0, kind: "ids" }): { store: InboxStore; textChars: number; threadIds: string[] } {
   refuseRealDataDir(dataDir, "scripts/inbox-search-bench.ts");
   const random = rng(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
@@ -74,7 +89,24 @@ export function seedInboxSearchWorld(dataDir: string, shape: SeedShape = WORST_C
   });
   let topical = topics[0]!;
   const zipf = (n: number) => Math.min(n - 1, Math.floor(Math.exp(random() * Math.log(n + 1)) - 1));
+  const HEX = "0123456789abcdef";
+  const B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const LOWER = "abcdefghijklmnopqrstuvwxyz";
+  const chars = (alphabet: string, n: number) => Array.from({ length: n }, () => alphabet[Math.floor(random() * alphabet.length)]).join("");
+  let serial = 0;
+  const uniqueToken = (): string => {
+    serial += 1;
+    if (unique.kind === "words") return chars(LOWER, 5 + Math.floor(random() * 8));
+    const r = random();
+    if (r < 0.25) return chars(HEX, random() < 0.5 ? 40 : 9);
+    if (r < 0.45) return `msg_${chars(B32, 26)}`;
+    if (r < 0.6) return `${chars(HEX, 8)}-${chars(HEX, 4)}-${chars(HEX, 4)}-${chars(HEX, 4)}-${chars(HEX, 12)}`;
+    if (r < 0.75) return String(1_700_000_000_000 + serial * 7919 + Math.floor(random() * 1000));
+    if (r < 0.85) return `2026-10-${String(1 + Math.floor(random() * 28)).padStart(2, "0")}T${String(Math.floor(random() * 24)).padStart(2, "0")}:${chars("012345", 1)}${chars("0123456789", 1)}:${chars("012345", 1)}${chars("0123456789", 1)}.${chars("0123456789", 3)}Z`;
+    return `/tmp/run-${chars(LOWER + "0123456789", 8)}/out-${chars(LOWER, 6)}.log`;
+  };
   const word = (): string => {
+    if (unique.share > 0 && random() < unique.share) return uniqueToken();
     const r = random();
     if (r < 0.45) return pick(COMMON);
     if (r < 0.7) return topical[zipf(topical.length)]!;
@@ -171,6 +203,7 @@ const QUERIES = [
   "relay", "rate limit", "retry storm", "deploy rollback", "the", "de", "re", "migration schema index", "cursor pag", "webhook",
   "jitter backoff", "pipeline nightly build", "token session lease", "kalo", "mine", "決済", "タイムアウト", "أخطاء", "relay mailbox rate limit", "bundle cdn",
   "idempotency", "percentile histogram", "tokenizer segmenter", "fixture snapshot", "nonexistentword", "pairing tailnet", "certificate", "latency timeout socket", "a b", "release checklist changelog",
+  "the an", "the and of", "to be",
 ];
 
 function percentile(values: number[], p: number): number {
@@ -178,9 +211,26 @@ function percentile(values: number[], p: number): number {
   return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]!;
 }
 
+/**
+ * Live memory after full collections: JSC's live object bytes plus its extra
+ * memory (typed-array backing stores, where the index keeps most of itself).
+ * `process.memoryUsage().heapUsed` is not used: it leaves the large typed
+ * arrays out and moves with garbage the server's requests leave.
+ */
+function heldBytes(): number {
+  for (let i = 0; i < 3; i++) Bun.gc(true);
+  const stats = heapStats() as { heapSize: number; extraMemorySize: number };
+  return stats.heapSize + stats.extraMemorySize;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const asJson = args.includes("--json");
+  const uniqueAt = args.indexOf("--unique");
+  const unique: UniqueMix = {
+    share: uniqueAt >= 0 ? Number(args[uniqueAt + 1]) / 100 : 0,
+    kind: args.includes("--unique-words") ? "words" : "ids",
+  };
   const keepAt = args.indexOf("--keep");
   const root = keepAt >= 0 ? args[keepAt + 1]! : mkdtempSync(join(tmpdir(), "plannotator-inbox-search-bench-"));
   mkdirSync(root, { recursive: true });
@@ -190,14 +240,14 @@ async function main() {
   process.env.PLANNOTATOR_DATA_DIR = dataDir;
   const log = (line: string) => (asJson ? process.stderr : process.stdout).write(`${line}\n`);
   const seedStart = performance.now();
-  const seeded = seedInboxSearchWorld(dataDir);
+  const seeded = seedInboxSearchWorld(dataDir, WORST_CASE, 1, unique);
   log(`seeded ${seeded.threadIds.length} threads, ${(seeded.textChars / 1024 / 1024).toFixed(1)} M characters in ${((performance.now() - seedStart) / 1000).toFixed(1)} s`);
   const { startInboxServer } = await import("../packages/server/inbox");
   const server = await startInboxServer({ dataDir, binaryPath: null, phones: false });
   const base = `http://127.0.0.1:${server.port}`;
   try {
     Bun.gc(true);
-    const heapBefore = process.memoryUsage().heapUsed;
+    const heapBefore = heldBytes();
     // Health with nothing else running, then while the first search builds the index.
     const idle: number[] = [];
     for (let i = 0; i < 60; i++) {
@@ -227,10 +277,11 @@ async function main() {
     await healthLoop;
     const stats = server.search.lastBuildStats()!;
     Bun.gc(true);
-    const heapAfter = process.memoryUsage().heapUsed;
+    const heapAfter = heldBytes();
 
     const took: number[] = [];
     const roundTrip: number[] = [];
+    const byQuery = new Map<string, number[]>();
     const project = server.store.listProjects()[0]!.id;
     for (let round = 0; round < 10; round++) {
       for (const q of QUERIES) {
@@ -239,6 +290,7 @@ async function main() {
           const answer = (await (await fetch(`${base}/api/inbox/search?q=${encodeURIComponent(q)}${extra}`)).json()) as Record<string, any>;
           roundTrip.push(performance.now() - t);
           took.push(answer.took_ms);
+          byQuery.set(q, [...(byQuery.get(q) ?? []), answer.took_ms]);
         }
       }
     }
@@ -262,10 +314,18 @@ async function main() {
       build_slices_over_8ms: stats.slicesOver8Ms,
       health_idle_ms: { p50: +percentile(idle, 50).toFixed(2), p95: +percentile(idle, 95).toFixed(2) },
       health_during_build_ms: { samples: health.length, p50: +percentile(health, 50).toFixed(2), p95: +percentile(health, 95).toFixed(2), max: +Math.max(...health).toFixed(2) },
+      slowest_queries_p95_ms: Object.fromEntries(
+        [...byQuery].map(([q, t]) => [q, +percentile(t, 95).toFixed(2)] as const).sort((a, b) => b[1] - a[1]).slice(0, 5),
+      ),
+      unique_share: unique.share,
+      unique_kind: unique.kind,
       query_server_ms: { samples: took.length, p50: +percentile(took, 50).toFixed(2), p95: +percentile(took, 95).toFixed(2), max: +Math.max(...took).toFixed(2) },
       query_round_trip_ms: { p50: +percentile(roundTrip, 50).toFixed(2), p95: +percentile(roundTrip, 95).toFixed(2) },
       index_heap_mb: +((heapAfter - heapBefore) / 1024 / 1024).toFixed(1),
       index_heap_over_text: +((heapAfter - heapBefore) / seeded.textChars).toFixed(2),
+      index_counted_mb: +(stats.indexBytes / 1024 / 1024).toFixed(1),
+      index_counted_over_text: +(stats.indexBytes / seeded.textChars).toFixed(2),
+      id_buckets: stats.idBuckets,
       late_message_found: (late.groups?.threads ?? []).length === 1,
       late_message_ms: +lateMs.toFixed(1),
       first_total_relay: first.totals,

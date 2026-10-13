@@ -227,6 +227,49 @@ describe("ranking", () => {
     // Alpha's equal match moves above beta's; the phrase still beats the plain match; nothing is hidden.
     expect(messageIds(search(index, "retry budget", { current: a.id }))).toEqual([inA.id, inB.id, better.id]);
   });
+
+  test("a decision ranks as its row reads: by its own state, not its thread's", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const archivedThread = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Old", thread: "a", body: "Notes." }).message;
+    const openThread = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "New", thread: "b", body: "Notes." }).message;
+    store.resolveThread(archivedThread.id, true);
+    const current = decision(store, project.id, "Deploy the relay first", { threadId: archivedThread.id });
+    // Newer, but replaced: it reads archived, so it ranks after the current one whatever its thread.
+    const replaced = decision(store, project.id, "Deploy the relay last", { threadId: openThread.id, state: "replaced" });
+    const index = await built(store);
+    const rows = search(index, "deploy relay").groups!.decisions!;
+    expect(rows.map((r) => r.id)).toEqual([current.id, replaced.id]);
+    expect(rows.map((r) => r.archived)).toEqual([false, true]);
+  });
+});
+
+describe("identifiers", () => {
+  test("hashes, ULIDs, UUIDs and timestamps are found by their whole value; thousands of them share buckets without false matches", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    const ids: { id: string; message: string }[] = [];
+    // 3,000 messages with 4 ids each: 12,000 ids over 8,192 buckets, so buckets are shared.
+    for (let i = 0; i < 3000; i++) {
+      const hash = Bun.hash(`h${i}`).toString(16).padStart(16, "0") + Bun.hash(`k${i}`).toString(16).padStart(16, "0");
+      const ulid = `01M4V7${Bun.hash(`u${i}`).toString(32).toUpperCase().padStart(14, "0")}${i}`.slice(0, 26);
+      const stamp = String(1_760_000_000_000 + i * 7919);
+      const uuid = `${hash.slice(0, 8)}-1a2b-4c3d-8e9f-${hash.slice(8, 20)}`;
+      const message = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Run ${i}`, thread: `t${i}`, body: `Commit ${hash} ran as ${ulid} at ${stamp}, request ${uuid}.` }).message;
+      for (const id of [hash, ulid, stamp, uuid]) ids.push({ id, message: message.id });
+    }
+    const index = await built(store);
+    expect(index.lastBuildStats()!.idBuckets).toBeLessThanOrEqual(8192);
+    for (const { id, message } of ids.filter((_, i) => i % 7 === 0)) expect([id, messageIds(search(index, id))]).toEqual([id, [message]]);
+    // With other words, in either order, and upper or lower case.
+    const { id, message } = ids[40]!;
+    expect(messageIds(search(index, `commit ${id.toLowerCase()}`))).toEqual([message]);
+    expect(messageIds(search(index, `${id} commit`))).toEqual([message]);
+    // Found by its whole value only: a prefix of an id is not a match (search-vocabulary.ts).
+    expect(messageIds(search(index, ids[0]!.id.slice(0, 12)))).toEqual([]);
+    // A well-formed id that is in no message.
+    expect(messageIds(search(index, "9fceb02d0ae598e95dc970b74767f19372d61af8"))).toEqual([]);
+  });
 });
 
 describe("filters", () => {
