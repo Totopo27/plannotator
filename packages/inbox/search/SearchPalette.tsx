@@ -121,22 +121,6 @@ function Secondary({ parts }: { parts: readonly (ReactNode | null | false)[] }) 
   );
 }
 
-function rowTitle(row: InboxSearchRow): string {
-  switch (row.type) {
-    case 'thread':
-      return row.title;
-    case 'message':
-      return row.snippet.text;
-    case 'file':
-    case 'guide':
-      return row.name;
-    case 'decision':
-      return row.text;
-    case 'project':
-      return row.name;
-  }
-}
-
 function RowBody({ row, phone, projectName }: { row: InboxSearchRow; phone: boolean; projectName: string }) {
   const project = <bdi title={projectName}>{projectName}</bdi>;
   switch (row.type) {
@@ -208,10 +192,17 @@ function RowBody({ row, phone, projectName }: { row: InboxSearchRow; phone: bool
   }
 }
 
+/** A mouse press in the list keeps focus in the input; the click still runs. */
+function keepInputFocus(event: ReactMouseEvent): void {
+  event.preventDefault();
+}
+
 export default function SearchPalette(props: SearchPaletteProps) {
   const { open, phone, currentProject, projects, onClose, onOpenResult } = props;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  /** An IME composition is under way in the input (its Escape is not the palette's). */
+  const composing = useRef(false);
   const listRef = useRef<HTMLDivElement>(null);
   const filtersRef = useRef<HTMLDivElement>(null);
   const uid = useId().replace(/[^A-Za-z0-9_-]/g, '');
@@ -388,6 +379,8 @@ export default function SearchPalette(props: SearchPaletteProps) {
 
   const expand = async (option: Extract<SearchOption, { kind: 'more' }>, index: number) => {
     if (!answered) return;
+    // Focus stays in the input, so the arrows go on from the expanded group.
+    inputRef.current?.focus();
     const already = expanded[option.group] ?? null;
     const offset = already ? already.length : 0;
     try {
@@ -444,6 +437,8 @@ export default function SearchPalette(props: SearchPaletteProps) {
 
   // ── keys ──
   const onInputKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    // While an IME composes, its keys are its own (candidate lists use the arrows, Escape cancels the composition).
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       if (options.length === 0) return;
@@ -452,8 +447,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
       return;
     }
     if (event.key === 'Enter') {
-      // An IME's Enter commits text; it never opens a result.
-      if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+      // (An IME's Enter, which commits text, returned above: it never opens a result.)
       event.preventDefault();
       const newTab = event.metaKey || event.ctrlKey;
       if (debounceTimer.current || pending) {
@@ -470,6 +464,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
     // The open palette's keys are its own: nothing reaches the window's shortcuts behind it.
     event.stopPropagation();
     if (event.key === 'Escape') {
+      if (event.nativeEvent.isComposing || event.keyCode === 229) return;
       event.preventDefault();
       if (menu) {
         const kind = menu.kind;
@@ -613,7 +608,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
   const body = (() => {
     if (error) {
       return (
-        <div className="ib-sp-empty" role="status">
+        <div className="ib-sp-empty">
           <span>Search isn&rsquo;t answering.</span>
           <span className="ib-sp-e2">
             <button type="button" data-search-retry="" onClick={() => run(q, filters)}>
@@ -647,7 +642,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
       if (!answered.q && !filtered) return <div className="ib-sp-empty ib-sp-quiet">Type to search threads, messages, files and decisions.</div>;
       const scope = scopeWords(filters, projectName);
       return (
-        <div className="ib-sp-empty" role="status" data-search-none="">
+        <div className="ib-sp-empty" data-search-none="">
           <span>
             {answered.q ? (
               <>
@@ -679,7 +674,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
       const headingId = `ib-sp-g-${uid}-${group.id}`;
       return (
         <div key={group.id} className="ib-sp-group" role="group" aria-labelledby={headingId} data-search-group={group.id}>
-          <div className="ib-sp-gh" id={headingId}>
+          <div className="ib-sp-gh" id={headingId} onMouseDown={keepInputFocus}>
             {group.heading}
             {group.total !== null && <span className="ib-sp-gn">{group.total.toLocaleString('en-US')}</span>}
             {group.id === 'recent-searches' && (
@@ -698,6 +693,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
               'aria-selected': selected,
               'data-option': i,
               onPointerMove: () => hl !== i && setHl(i),
+              onMouseDown: keepInputFocus,
               onClick: (event: ReactMouseEvent) => activate(i, event.metaKey || event.ctrlKey),
             };
             if (option.kind === 'recent-q') {
@@ -724,7 +720,7 @@ export default function SearchPalette(props: SearchPaletteProps) {
             }
             const row = option.row;
             return (
-              <div key={`${row.type}-${row.id}`} className="ib-sp-row" {...common} data-result={row.type} data-result-id={row.id} title={rowTitle(row)}>
+              <div key={`${row.type}-${row.id}`} className="ib-sp-row" {...common} data-result={row.type} data-result-id={row.id}>
                 <RowBody row={row} phone={phone} projectName={projectName(row.project.id)} />
               </div>
             );
@@ -748,6 +744,8 @@ export default function SearchPalette(props: SearchPaletteProps) {
       onCancel={(event) => {
         // Escape on a control is handled above (a menu first); this is Escape with focus nowhere in particular.
         event.preventDefault();
+        // An Escape that cancelled an IME composition closes nothing.
+        if (composing.current) return;
         if (menu) setMenu(null);
         else close('dismissed');
       }}
@@ -781,6 +779,15 @@ export default function SearchPalette(props: SearchPaletteProps) {
           value={q}
           onChange={(event) => onInput(event.target.value)}
           onKeyDown={onInputKey}
+          onCompositionStart={() => {
+            composing.current = true;
+          }}
+          onCompositionEnd={() => {
+            // After the key that ended it (an Escape's cancel event comes first).
+            setTimeout(() => {
+              composing.current = false;
+            }, 0);
+          }}
         />
         <button type="button" className="ib-sp-cancel" data-search-cancel="" onClick={() => close('dismissed')}>
           Cancel

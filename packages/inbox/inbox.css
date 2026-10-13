@@ -1346,6 +1346,8 @@ pre code.pn-code[data-keep-layout] {
   .ib-body [data-question-key] > [data-pinpoint-ignore]:first-child,
   .ib-body [data-question-key] > [data-pinpoint-ignore]:first-child > span:last-child { flex-wrap: wrap; row-gap: 4px; }
   .ib-msg, .ib-pane.ib-withfile .ib-msg { padding-left: 0; }
+  /* a message landed on from search: its ring clears the text (the message has no padding of its own here), and nothing moves */
+  .pn-inbox [data-message-article].ib-q-target, .pn-inbox [data-message-article].ib-q-target-out { margin-inline: -8px; padding-inline: 8px; }
   .ib-sender { gap: 10px; align-items: center; }
   .ib-whobox { flex: 1; }
   .ib-whobox > .ib-who, .ib-whobox > .ib-to { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -197,6 +197,14 @@ function writeRoute(route: Route, options: { replace?: boolean } = {}): void {
   window.dispatchEvent(new HashChangeEvent('hashchange'));
 }
 
+/** A `msg=` with no thread to land in (a hand-edited or truncated link) leaves the address bar; the route already ignores it. */
+function stripStrayMsg(): void {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  if (!params.has('msg') || params.get('thread')) return;
+  const hash = hashOf(readRoute());
+  window.history.replaceState(window.history.state, '', hash || window.location.pathname + window.location.search);
+}
+
 /**
  * Leave the screen on top for the one under it (a thread for the list, a
  * file for its thread). On a phone that is the browser's Back when this
@@ -406,7 +414,11 @@ function Inbox() {
   const { observe: observeEvent, flush: flushNotifications } = notifications;
 
   useEffect(() => {
-    const onHash = () => setRoute(readRoute());
+    const onHash = () => {
+      stripStrayMsg();
+      setRoute(readRoute());
+    };
+    stripStrayMsg();
     window.addEventListener('hashchange', onHash);
     window.addEventListener('popstate', onHash);
     return () => {
@@ -888,8 +900,15 @@ function Inbox() {
   };
   const openSearchResult = (hash: string, land: SearchLanding | null) => {
     searchLanding.current = land;
-    // A new history entry: Back returns to where the search started (on a phone, the list).
-    writeRoute(routeOf(hash));
+    const now = routeRef.current;
+    const next = routeOf(hash);
+    // As a row click does (openRow): searched from a project's list, the list stays that project's.
+    if (now.page === 'inbox' && next.page === 'inbox' && next.thread) next.project = now.project;
+    // Landing in the thread already open (nothing beside it) replaces the entry: once `msg=` drops,
+    // a new one would equal the last and the first Back would do nothing.
+    const sameThread = now.page === 'inbox' && !!now.thread && now.thread === next.thread && !now.file && !now.guide;
+    // Otherwise a new history entry: Back returns to where the search started (on a phone, the list).
+    writeRoute(next, sameThread ? { replace: true } : {});
   };
   /** The thread landed on the message `msg=` named: drop it from the hash, so a reload does not jump again. */
   const landed = () => {

@@ -18,6 +18,8 @@
  *    "Search everywhere" clears it; focus returns to the Search entry;
  *  - long, right-to-left and CJK text never overflows the palette;
  *  - ⌘/Ctrl+Enter opens a new tab and keeps the palette open;
+ *  - searched from a project, a result keeps the list on it; the same thread
+ *    again replaces its entry; a stray msg= leaves the address;
  *  - a phone: the list header's search icon opens a full-screen sheet with
  *    Cancel; a result opens the thread, and Back returns to the list.
  *
@@ -72,7 +74,7 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   rmSync(proofDir, { recursive: true, force: true });
   mkdirSync(proofDir, { recursive: true });
   const root = inboxScratch('plannotator-inbox-search-e2e-');
-  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_INBOX_CONNECT: '0' };
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: '/usr/bin/true', PLANNOTATOR_INBOX_CONNECT: '0' };
   const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
   expect(started.status, started.stderr).toBe(0);
   url = started.stdout.trim();
@@ -177,6 +179,46 @@ test('↓ moves the highlight; Enter on a message lands on it with the words hig
   // Back returns to where the search started.
   await page.goBack();
   await expect.poll(() => page.evaluate(() => window.location.hash)).not.toContain(world.threads.retry);
+});
+
+/** The project a thread is in (its root message's). */
+async function projectOf(p: Page, threadId: string): Promise<string> {
+  return p.evaluate(async (id) => {
+    const body = (await (await fetch(`/api/inbox/threads/${id}`)).json()) as { thread: { messages: { project_id: string }[] } };
+    return body.thread.messages[0]!.project_id;
+  }, threadId);
+}
+
+test('searched from a project, a result keeps the list on that project; a result in the open thread replaces its entry; a stray msg= leaves the address', async () => {
+  const projectId = await projectOf(page, world.threads.retry);
+  await page.goto(`${url}#project=${projectId}`);
+  await openFromSidebar(page);
+  await input(page).fill('retry budget');
+  await settled(page);
+  // A mouse press on a result keeps focus in the input until the click opens it.
+  await palette(page).locator(`[data-result="message"][data-result-id="${world.retryBudget}"]`).hover();
+  await page.mouse.down();
+  await expect(input(page)).toBeFocused();
+  await page.mouse.up();
+  await expect(palette(page)).toBeHidden();
+  // As a row click does: the list stays that project's, beside the thread.
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(`#project=${projectId}&thread=${world.threads.retry}`);
+  const length = await page.evaluate(() => history.length);
+  // The same thread again, from a result: no second entry, so the first Back leaves the thread.
+  await openFromSidebar(page);
+  await input(page).fill('retry budget');
+  await settled(page);
+  await palette(page).locator(`[data-result="message"][data-result-id="${world.retryBudget}"]`).click();
+  await expect(palette(page)).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(`#project=${projectId}&thread=${world.threads.retry}`);
+  expect(await page.evaluate(() => history.length)).toBe(length);
+  await page.goBack();
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(`#project=${projectId}`);
+  // A msg= with no thread is dropped from the address.
+  await page.goto(`${url}#project=${projectId}&msg=${world.retryBudget}`);
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(`#project=${projectId}`);
+  // The next tests search from the whole Inbox.
+  await page.goto(url);
 });
 
 test('recent searches come back on the next open, and Clear forgets them', async () => {
@@ -314,6 +356,50 @@ test('a phone: the list header opens a full-screen sheet; a result opens the thr
     await expect(sheetEntry).toBeHidden();
     await palette(p).locator('[data-search-cancel]').tap();
     await expect(palette(p)).toBeHidden();
+  } finally {
+    await phone.close();
+  }
+});
+
+test('a phone, from a project list: a result keeps the project, and ‹ is the browser’s Back to that list (D7)', async ({ browser }: { browser: Browser }) => {
+  const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: 'light' });
+  try {
+    const p = await phone.newPage();
+    await p.goto(url);
+    const projectId = await projectOf(p, world.threads.relay);
+    await p.goto(`${url}#project=${projectId}`);
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'list');
+    const before = await p.evaluate(() => history.length);
+    await p.locator('.ib-lhead .ib-lhead-search').tap();
+    await input(p).fill('rate lim');
+    await settled(p);
+    await palette(p).locator(`[data-result="thread"][data-result-id="${world.threads.relay}"]`).tap();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'thread');
+    await expect.poll(() => p.evaluate(() => window.location.hash)).toBe(`#project=${projectId}&thread=${world.threads.relay}`);
+    expect(await p.evaluate(() => history.length)).toBe(before + 1);
+    await shot(p, '25-phone-project-result', ['light']);
+    await p.locator('[data-phone-back]').tap();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'list');
+    await expect.poll(() => p.evaluate(() => window.location.hash)).toBe(`#project=${projectId}`);
+    // The browser's Back, not a new entry: the thread is still ahead.
+    expect(await p.evaluate(() => history.length)).toBe(before + 1);
+    await p.goForward();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'thread');
+    // A message landed on: its ring clears the text (the message has no padding of its own on a phone) and nothing moves.
+    await p.locator('[data-phone-back]').tap();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'list');
+    await p.locator('.ib-lhead .ib-lhead-search').tap();
+    await input(p).fill('retry budget');
+    await settled(p);
+    await palette(p).locator(`[data-result="message"][data-result-id="${world.retryBudget}"]`).tap();
+    const article = p.locator(`section.ib-pane [data-message-article="${world.retryBudget}"]`);
+    await expect(article).toHaveClass(/ib-q-target/);
+    const ring = await article.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return { padding: style.paddingLeft, margin: style.marginLeft };
+    });
+    expect(ring).toEqual({ padding: '8px', margin: '-8px' });
+    await shot(p, '26-phone-landed-message', ['light']);
   } finally {
     await phone.close();
   }

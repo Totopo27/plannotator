@@ -237,6 +237,71 @@ test.skipIf(!hasDom)('Show all asks for the group and expands it in place', asyn
   expect(host!.querySelector('[data-show-more]')).toBeNull();
 });
 
+test.skipIf(!hasDom)('focus stays in the input: a mouse press in the list takes no focus, and after Show all the arrows go on; no option repeats its text as a title', async () => {
+  respond = async (call) => {
+    const q = call.url.searchParams.get('q')!;
+    if (call.url.searchParams.get('group') === 'messages') {
+      return answer({ q, terms: ['rate'], totals: totals({ threads: 1, messages: 12 }), groups: { messages: Array.from({ length: 12 }, (_, i) => messageRow(`msg_m${i}`, 'msg_t2', `rate ${i}`)) }, recent: null });
+    }
+    return q ? results(q) : answer({});
+  };
+  await render();
+  await type('rate');
+  await waitFor(() => options().length === 10);
+  // A press on a row, a group heading and Show all is not a focus change (the click still runs).
+  for (const target of [options()[1]!, host!.querySelector('.ib-sp-gh')!, options().at(-1)!]) {
+    const press = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    target.dispatchEvent(press);
+    expect(press.defaultPrevented).toBe(true);
+  }
+  expect(options().every((o) => !o.hasAttribute('title'))).toBe(true);
+  // Show all: focus back in the input (even from elsewhere), and the arrows move on from the expanded group.
+  input().blur();
+  await act(async () => {
+    options().at(-1)!.click();
+  });
+  await waitFor(() => options().length === 13);
+  expect(document.activeElement).toBe(input());
+  const before = input().getAttribute('aria-activedescendant');
+  await key(input(), { key: 'ArrowDown' });
+  expect(input().getAttribute('aria-activedescendant')).not.toBe(before);
+});
+
+test.skipIf(!hasDom)('while an IME composes, the arrows and Escape are its own; No matches is announced once, by the live region', async () => {
+  respond = async (call) => {
+    const q = call.url.searchParams.get('q')!;
+    if (q === 'jitter') return answer({ q, terms: ['jitter'], totals: totals({}), groups: {}, recent: null });
+    return q ? results(q) : answer({});
+  };
+  await render();
+  await type('rate');
+  await waitFor(() => options().length === 10);
+  const at = input().getAttribute('aria-activedescendant');
+  await key(input(), { key: 'ArrowDown', isComposing: true });
+  expect(input().getAttribute('aria-activedescendant')).toBe(at);
+  await key(input(), { key: 'Escape', isComposing: true });
+  // The dialog's cancel while a composition is under way closes nothing either.
+  await act(async () => {
+    input().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    host!.querySelector('dialog')!.dispatchEvent(new Event('cancel', { cancelable: true }));
+  });
+  expect(closed).toEqual([]);
+  await act(async () => {
+    input().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 5));
+  });
+  await key(input(), { key: 'ArrowDown' });
+  expect(input().getAttribute('aria-activedescendant')).not.toBe(at);
+  // No matches: shown in the list, spoken by the one live region.
+  await type('jitter');
+  await waitFor(() => host!.querySelector('[data-search-none]') !== null);
+  expect(host!.querySelector('[role="listbox"] [role="status"]')).toBeNull();
+  expect(host!.querySelectorAll('[role="status"]')).toHaveLength(1);
+  expect(host!.querySelector('[data-search-live]')!.textContent).toContain('No matches');
+  await key(input(), { key: 'Escape' });
+  expect(closed).toEqual(['dismissed']);
+});
+
 test.skipIf(!hasDom)('chips: the Project chip starts on the current project; a menu by keys; Escape closes the menu before the palette; No matches names the scope', async () => {
   respond = async (call) => {
     if (call.url.searchParams.get('status') === 'archived') return answer({ q: 'jitter', terms: ['jitter'], totals: totals({}), groups: {}, recent: null });
