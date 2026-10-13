@@ -497,7 +497,8 @@ export class InboxSearchIndex {
   private noteLine(line: InboxLine): void {
     switch (line.kind) {
       case "project":
-        this.dirtyProjects.add(line.record.id);
+        // A new project can change the others' names too ("api" becomes "api · work"): every label is read again.
+        for (const project of this.store.listProjects()) this.dirtyProjects.add(project.id);
         break;
       case "message":
         this.dirtyMessages.add(line.record.id);
@@ -1331,21 +1332,9 @@ function fileKind(kind: string, name: string): string {
 }
 
 /**
- * Project names as the person reads them: the name, and when two projects
- * share one, the parent folder after it ("api · work").
+ * Project names as the person reads them: the store's names (`inboxProjectLabels`:
+ * the folder's real name, with its parent folder when two match), never the slug.
  */
 export function projectLabels(projects: readonly InboxProject[]): Map<string, InboxSearchProjectRef> {
-  const counts = new Map<string, number>();
-  for (const project of projects) counts.set(project.name, (counts.get(project.name) ?? 0) + 1);
-  const out = new Map<string, InboxSearchProjectRef>();
-  for (const project of projects) {
-    let name = project.name;
-    if ((counts.get(project.name) ?? 0) > 1) {
-      const parts = project.root.split(/[\\/]+/).filter(Boolean);
-      const parent = parts.length >= 2 ? parts[parts.length - 2] : null;
-      if (parent) name = `${project.name} · ${parent}`;
-    }
-    out.set(project.id, { id: project.id, name });
-  }
-  return out;
+  return new Map(projects.map((project) => [project.id, { id: project.id, name: project.name }]));
 }

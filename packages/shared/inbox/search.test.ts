@@ -279,8 +279,8 @@ describe("filters", () => {
 describe("text in every script", () => {
   test("Japanese without spaces, Arabic as written, accents folded; marks in the original", async () => {
     const store = open();
-    const ja = store.ensureProject({ name: "決済サービス", root: "/w/ja" });
-    const ar = store.ensureProject({ name: "بوابة-الدفع", root: "/w/ar" });
+    const ja = store.ensureProject({ name: "決済サービス", root: "/w/決済サービス" });
+    const ar = store.ensureProject({ name: "بوابة-الدفع", root: "/w/بوابة-الدفع" });
     const jaThread = store.sendMessage({ project_id: ja.id, author: CLAUDE, subject: "デプロイ後の決済エラーの調査", body: "昨夜の deploy の後、決済APIのタイムアウトが3倍に増えました。" }).message;
     const arThread = store.sendMessage({ project_id: ar.id, author: CLAUDE, subject: "تقرير أخطاء الدفع", body: "فشل النشر على الخادم الثاني بسبب مهلة الاتصال." }).message;
     const fr = store.sendMessage({ project_id: ar.id, author: CLAUDE, subject: "Résumé of the café visit", thread: "fr", body: "Naïve résumé." }).message;
@@ -330,6 +330,17 @@ describe("the index follows the store", () => {
     await index.ensureBuilt();
     expect(search(index, "retry storm").totals).toMatchObject({ threads: 0, messages: 0 });
     expect(search(index, "jitter").totals!.decisions).toBe(1);
+  });
+
+  test("a second project with the same folder name relabels the first, and its threads are found by the new label", async () => {
+    const store = open();
+    const work = store.ensureProject({ name: "api", root: "/home/me/work/api" });
+    const thread = store.sendMessage({ project_id: work.id, author: CLAUDE, subject: "Orders endpoint", body: "Cursor pagination." }).message;
+    const index = await built(store);
+    expect(threadIds(search(index, "orders work"))).toEqual([]);
+    store.ensureProject({ name: "api", root: "/home/me/personal/api" });
+    expect(threadIds(search(index, "orders work"))).toEqual([thread.id]);
+    expect(search(index, "orders").groups!.threads!.map((t) => t.project.name)).toEqual(["api · work"]);
   });
 
   test("a subject derived from a question follows its replacement", async () => {
