@@ -120,6 +120,36 @@ describe("GET /api/inbox/search", () => {
     expect(found.body.groups.threads.map((t: Json) => t.id)).toEqual([late]);
   }, 30_000);
 
+  test("another site or another localhost port is refused before anything is searched; the window's own page is answered", async () => {
+    const w = await setup();
+    await w.send("Relay rate limit", "The relay allows 20 mailbox creates a minute.");
+    await w.searchSettled("q=relay");
+    const path = `${w.base}/api/inbox/search?q=relay`;
+    const searchedBefore = w.server.search.lastBuildStats();
+    for (const headers of [
+      { "Sec-Fetch-Site": "cross-site", Origin: "https://evil.example" },
+      { "Sec-Fetch-Site": "cross-site" },
+      // Another localhost port is the same site: a page there must not time our searches either.
+      { "Sec-Fetch-Site": "same-site", Origin: "http://localhost:5173" },
+      // A browser without Fetch Metadata: the Origin alone decides.
+      { Origin: "https://evil.example" },
+      { Origin: "null" },
+    ] as Record<string, string>[]) {
+      const response = await fetch(path, { headers });
+      expect([JSON.stringify(headers), response.status, ((await response.json()) as Json).code]).toEqual([JSON.stringify(headers), 403, "cross_origin"]);
+    }
+    // Recent searches are refused the same way.
+    expect((await fetch(`${w.base}/api/inbox/search/recent`, { method: "POST", headers: { "Sec-Fetch-Site": "same-site", "Content-Type": "application/json" }, body: JSON.stringify({ q: "x" }) })).status).toBe(403);
+    // The window's own page (same origin) and a client without browser headers are answered.
+    const own = await fetch(path, { headers: { "Sec-Fetch-Site": "same-origin", Origin: w.base } });
+    expect(own.status).toBe(200);
+    expect(((await own.json()) as Json).totals.threads).toBe(1);
+    expect((await fetch(path, { headers: { "Sec-Fetch-Site": "same-origin" } })).status).toBe(200);
+    expect((await fetch(path, { headers: { "Sec-Fetch-Site": "none" } })).status).toBe(200);
+    expect((await fetch(path)).status).toBe(200);
+    expect(w.server.search.lastBuildStats()).toBe(searchedBefore);
+  });
+
   test("many searches at once agree", async () => {
     const w = await setup();
     for (let i = 0; i < 30; i++) await w.send(`Deploy ${i}`, `The deploy number ${i} went out.`);

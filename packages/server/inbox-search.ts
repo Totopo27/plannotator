@@ -26,6 +26,7 @@ import { INBOX_SEARCH_QUERY_MAX } from "@plannotator/core/inbox-search";
 import { isInboxId } from "@plannotator/core/inbox-types";
 import { checkServerSession, INBOX_SERVER_SESSION_MISMATCH_ERROR, serverSessionMismatchBody } from "@plannotator/core/server-session";
 import { InboxError } from "@plannotator/shared/inbox/schema";
+import { isSameOriginOrNoOrigin } from "@plannotator/shared/request-origin";
 import {
   INBOX_SEARCH_GROUPS,
   INBOX_SEARCH_LIMIT_MAX,
@@ -62,6 +63,20 @@ const JSON_HEADERS = {
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
+}
+
+const CROSS_SITE_BODY = { error: "Cross-origin requests are not accepted.", code: "cross_origin" };
+
+/**
+ * A request another site, or another localhost port, made: `Sec-Fetch-Site`
+ * says cross-site or same-site, or an Origin names another page. The
+ * attachment and message-image routes refuse the same way. A request with
+ * neither header (a non-browser client) and the window's own page pass.
+ */
+function crossSite(req: Request): boolean {
+  const site = req.headers.get("sec-fetch-site")?.trim().toLowerCase();
+  if (site === "cross-site" || site === "same-site") return true;
+  return !isSameOriginOrNoOrigin(req.headers.get("origin"), req.headers.get("host") ?? "", site ?? null);
 }
 
 /** The recent searches on disk, newest first; anything unreadable reads as none. */
@@ -157,6 +172,10 @@ export function createInboxSearchRoutes(input: { store: InboxStore; serverSessio
     index,
     dispose: () => index.dispose(),
     async handle(req, url) {
+      if (url.pathname !== INBOX_SEARCH_PATH && url.pathname !== INBOX_SEARCH_RECENT_PATH) return null;
+      // Another site (or another localhost port: same-site) never reaches search. It could not read
+      // the answer, but it picks the query, and how long a search takes says whether it found anything.
+      if (crossSite(req)) return json(CROSS_SITE_BODY, 403);
       if (url.pathname === INBOX_SEARCH_PATH) {
         if (req.method !== "GET") return json({ error: "Use GET." }, 405);
         return search(url);
