@@ -61,6 +61,7 @@ import {
   type InboxSectionId,
 } from "@plannotator/core/inbox-types";
 import { inboxRowArchived } from "./list";
+import { isIdLikeToken, Postings, Vocabulary } from "./search-vocabulary";
 import type { InboxStore } from "./store";
 
 // The wire (answers, rows, the query) is @plannotator/core/inbox-search's, so the window reads it without this package.
@@ -212,92 +213,6 @@ interface Doc {
   sig: string;
 }
 
-/**
- * Token ids by string, an open-addressing table over FNV-1a hashes of the
- * folded characters. `idOfSpan` looks an ASCII token up straight from the
- * text it sits in (lower-casing as it hashes), so the build makes a string
- * only for a token it has never seen.
- */
-class TokenTable {
-  private slots = new Int32Array(1 << 16);
-  private hashes: number[] = [0];
-  private count = 0;
-  constructor(private readonly words: string[]) {}
-
-  private static hash(token: string): number {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < token.length; i++) h = Math.imul(h ^ token.charCodeAt(i), 0x01000193);
-    return h >>> 0;
-  }
-
-  /** The id of a folded token, or -1. */
-  idOf(token: string): number {
-    const h = TokenTable.hash(token);
-    const mask = this.slots.length - 1;
-    for (let i = h & mask; ; i = (i + 1) & mask) {
-      const slot = this.slots[i]!;
-      if (slot === 0) return -1;
-      const id = slot - 1;
-      if (this.hashes[id] === h && this.words[id] === token) return id;
-    }
-  }
-
-  /** The id of the ASCII token `text[start, end)` (lower-cased when `upper`), or -1. */
-  idOfSpan(text: string, start: number, end: number, upper: boolean): number {
-    let h = 0x811c9dc5;
-    for (let k = start; k < end; k++) {
-      let c = text.charCodeAt(k);
-      if (upper && c >= 0x41 && c <= 0x5a) c += 0x20;
-      h = Math.imul(h ^ c, 0x01000193);
-    }
-    h >>>= 0;
-    const mask = this.slots.length - 1;
-    const length = end - start;
-    for (let i = h & mask; ; i = (i + 1) & mask) {
-      const slot = this.slots[i]!;
-      if (slot === 0) return -1;
-      const id = slot - 1;
-      if (this.hashes[id] !== h) continue;
-      const word = this.words[id]!;
-      if (word.length !== length) continue;
-      let same = true;
-      for (let k = 0; k < length; k++) {
-        let c = text.charCodeAt(start + k);
-        if (upper && c >= 0x41 && c <= 0x5a) c += 0x20;
-        if (word.charCodeAt(k) !== c) {
-          same = false;
-          break;
-        }
-      }
-      if (same) return id;
-    }
-  }
-
-  /** Add a folded token (not present) and return its id. */
-  add(token: string): number {
-    const id = this.words.length;
-    this.words.push(token);
-    const h = TokenTable.hash(token);
-    this.hashes[id] = h;
-    this.count += 1;
-    if (this.count * 2 > this.slots.length) this.grow();
-    else this.place(id, h);
-    return id;
-  }
-
-  private place(id: number, h: number): void {
-    const mask = this.slots.length - 1;
-    let i = h & mask;
-    while (this.slots[i] !== 0) i = (i + 1) & mask;
-    this.slots[i] = id + 1;
-  }
-
-  private grow(): void {
-    this.slots = new Int32Array(this.slots.length * 2);
-    for (let id = 1; id < this.words.length; id++) this.place(id, this.hashes[id]!);
-  }
-}
-
 /** A growable byte buffer for varints. */
 class Bytes {
   buf: Uint8Array;
@@ -322,37 +237,6 @@ class Bytes {
   take(): Uint8Array {
     return this.buf.slice(0, this.len);
   }
-}
-
-/** Decode a varint sequence into `out` (grown as needed); returns the count and the buffer. */
-function decodeVarints(bytes: Uint8Array, length: number, out: Int32Array, delta: boolean): { n: number; out: Int32Array } {
-  let n = 0;
-  let p = 0;
-  let previous = 0;
-  while (p < length) {
-    let value = bytes[p++]!;
-    if (value & 0x80) {
-      value &= 0x7f;
-      let shift = 7;
-      let b: number;
-      do {
-        b = bytes[p++]!;
-        value |= (b & 0x7f) << shift;
-        shift += 7;
-      } while (b & 0x80);
-    }
-    if (delta) {
-      previous += value;
-      value = previous;
-    }
-    if (n >= out.length) {
-      const grown = new Int32Array(Math.max(out.length * 2, 1024));
-      grown.set(out);
-      out = grown;
-    }
-    out[n++] = value;
-  }
-  return { n, out };
 }
 
 /** Facts of a thread that filters and ranking read, from its list row; cached until a line touches the thread. */
@@ -392,6 +276,10 @@ export interface InboxSearchBuildStats {
   threads: number;
   tokens: number;
   vocabulary: number;
+  /** Shared ids in use by id-like tokens (hashes, ULIDs, timestamps; see search-vocabulary.ts). */
+  idBuckets: number;
+  /** The index's memory, roughly (`indexBytes`). */
+  indexBytes: number;
   slices: number;
   longestSliceMs: number;
   /** Slices that ran past 8 ms (the brief's bound): a collection or a long message at the end of a slice. */
@@ -408,16 +296,9 @@ export class InboxSearchIndex {
   private docs: (Doc | null)[] = [];
   private byKey = new Map<string, number>();
   private dead = 0;
-  /** Token strings by id (0 is the field separator), and the table that finds an id from a string or a span of text. */
-  private words: string[] = [""];
-  private table = new TokenTable(this.words);
-  /** Each token's documents, delta-encoded varints in increasing document order (a document number is never reused). */
-  private postBuf: Bytes[] = [new Bytes(1)];
-  private postLast: number[] = [0];
-  private postCount: number[] = [0];
-  /** Token ids in string order, for the last term's prefix; ids added since the last sort wait in `pending`. */
-  private sorted: Int32Array | null = null;
-  private pending: number[] = [];
+  /** Token ids (0 is the field separator; id-like tokens share buckets) and each id's documents in increasing order (a document number is never reused). See search-vocabulary.ts. */
+  private vocab = new Vocabulary();
+  private postings = new Postings();
   private facts = new Map<string, ThreadFacts>();
   /** Project names as indexed into thread documents, to notice a rename. */
   private projectNames = new Map<string, string>();
@@ -439,9 +320,8 @@ export class InboxSearchIndex {
   // Query scratch, reused.
   private mark = new Int32Array(0);
   private epoch = 0;
-  private termOf = new Int32Array(0);
-  private tokenMark = new Int32Array(0);
-  private tokenEpoch = 0;
+  /** Per id, the query terms it matches as bits (a query has at most 8 terms). */
+  private termOf = new Uint8Array(0);
   private seq = new Bytes(4096);
 
   constructor(store: InboxStore, options: InboxSearchIndexOptions = {}) {
@@ -532,13 +412,8 @@ export class InboxSearchIndex {
     this.docs = [];
     this.byKey = new Map();
     this.dead = 0;
-    this.words = [""];
-    this.table = new TokenTable(this.words);
-    this.postBuf = [new Bytes(1)];
-    this.postLast = [0];
-    this.postCount = [0];
-    this.sorted = null;
-    this.pending = [];
+    this.vocab = new Vocabulary();
+    this.postings = new Postings();
     this.facts = new Map();
     this.projectNames = new Map();
   }
@@ -585,9 +460,19 @@ export class InboxSearchIndex {
       this.indexDecision(decision as InboxDecision);
       if (!(await maybeYield())) return;
     }
+    // Give back the arrays' growth slack, each copy in a slice of its own.
+    for (const part of [this.vocab, this.postings]) {
+      longest = Math.max(longest, this.now() - sliceStart);
+      if (this.now() - sliceStart > 8) over += 1;
+      await this.yieldNow();
+      slices += 1;
+      sliceStart = this.now();
+      if (this.generation !== generation || this.store.reloadCount() !== reloads) return;
+      part.compact();
+    }
     longest = Math.max(longest, this.now() - sliceStart);
+    if (this.now() - sliceStart > 8) over += 1;
     if (this.generation !== generation || this.store.reloadCount() !== reloads) return;
-    this.sortVocabulary();
     this.reloadsSeen = reloads;
     this.built = true;
     // Lines that arrived while building touched records already read or not yet: re-index them now.
@@ -598,7 +483,9 @@ export class InboxSearchIndex {
       docs: this.byKey.size,
       threads: threadIds.length,
       tokens,
-      vocabulary: this.words.length - 1,
+      vocabulary: this.vocab.count(),
+      idBuckets: this.vocab.bucketCount(),
+      indexBytes: this.indexBytes(),
       slices,
       longestSliceMs: longest,
       slicesOver8Ms: over,
@@ -637,35 +524,6 @@ export class InboxSearchIndex {
 
   // ── documents ──
 
-  /** A new token's postings start empty; a prefix search finds it in `pending` until the next sort. */
-  private added(id: number): number {
-    this.postBuf.push(new Bytes(4));
-    this.postLast.push(0);
-    this.postCount.push(0);
-    if (this.sorted) this.pending.push(id);
-    return id;
-  }
-
-  private tokenId(token: string): number {
-    const id = this.table.idOf(token);
-    return id >= 0 ? id : this.added(this.table.add(token));
-  }
-
-  private spanId(text: string, start: number, end: number, upper: boolean): number {
-    const id = this.table.idOfSpan(text, start, end, upper);
-    if (id >= 0) return id;
-    const raw = text.slice(start, end);
-    return this.added(this.table.add(upper ? raw.toLowerCase() : raw));
-  }
-
-  private sortVocabulary(): void {
-    const words = this.words;
-    const ids = Array.from({ length: words.length - 1 }, (_, i) => i + 1);
-    ids.sort((a, b) => (words[a]! < words[b]! ? -1 : words[a]! > words[b]! ? 1 : 0));
-    this.sorted = Int32Array.from(ids);
-    this.pending = [];
-  }
-
   private put(key: string, type: DocType, meta: { ref: string; threadId: string | null; projectId: string; at: string; from: InboxSearchFrom | null }, fields: FieldSet, sig: string): void {
     const existing = this.byKey.get(key);
     const at = Date.parse(meta.at) || 0;
@@ -683,23 +541,19 @@ export class InboxSearchIndex {
     seq.len = 0;
     let count = 0;
     let lastWasToken = false;
-    // The document's number, and each token's posting written the first time the token is seen in it.
+    // The document's number, and each token's posting written the first time the token is seen in it (`Postings.add` skips the rest).
     const number = this.docs.length;
-    const epoch = this.nextTokenEpoch();
+    const vocab = this.vocab;
+    const postings = this.postings;
     const add = (id: number) => {
       seq.push(id);
       count += 1;
       lastWasToken = true;
-      if (id >= this.tokenMark.length) this.growTokenMark();
-      if (this.tokenMark[id] === epoch) return;
-      this.tokenMark[id] = epoch;
-      this.postBuf[id]!.push(number - this.postLast[id]!);
-      this.postLast[id] = number;
-      this.postCount[id]! += 1;
+      postings.add(id, number);
     };
-    const visit = (token: string) => add(this.tokenId(token));
+    const visit = (token: string) => add(vocab.idOfToken(token));
     let current = "";
-    const visitSpan = (start: number, end: number, upper: boolean) => add(this.spanId(current, start, end, upper));
+    const visitSpan = (start: number, end: number, upper: boolean) => add(vocab.idOfSpan(current, start, end, upper));
     const scan = (text: string) => {
       current = text;
       scanInboxSearchTokens(text, visitSpan, visit);
@@ -725,28 +579,16 @@ export class InboxSearchIndex {
     this.byKey.set(key, number);
   }
 
-  private growTokenMark(): void {
-    const grown = new Int32Array(Math.max(this.words.length * 2, 1024));
-    grown.set(this.tokenMark);
-    this.tokenMark = grown;
-  }
-
-  /** A fresh mark for "this token was seen in this document". */
-  private nextTokenEpoch(): number {
-    if (this.tokenMark.length < this.words.length) this.growTokenMark();
-    this.tokenEpoch += 1;
-    if (this.tokenEpoch > 0x7ffffff0) {
-      this.tokenMark.fill(0);
-      this.tokenEpoch = 1;
-    }
-    return this.tokenEpoch;
-  }
-
   /** A token's documents (live or not), in increasing order. */
   private postingsOf(id: number): Int32Array {
-    const bytes = this.postBuf[id]!;
-    const decoded = decodeVarints(bytes.buf, bytes.len, new Int32Array(Math.max(1, this.postCount[id]!)), true);
-    return decoded.out.subarray(0, decoded.n);
+    return this.postings.list(id);
+  }
+
+  /** What the index holds in memory, roughly (typed arrays' capacity, the token sequences, the per-document records). */
+  indexBytes(): number {
+    let docs = 0;
+    for (const doc of this.docs) docs += doc ? 160 + doc.tokens.byteLength + doc.key.length * 2 + doc.sig.length * 2 : 8;
+    return this.vocab.bytes() + this.postings.bytes() + docs;
   }
 
   private remove(key: string): void {
@@ -851,24 +693,6 @@ export class InboxSearchIndex {
 
   // ── query ──
 
-  private prefixIds(prefix: string): number[] {
-    const out: number[] = [];
-    if (!this.sorted) this.sortVocabulary();
-    if (this.pending.length > 4000) this.sortVocabulary();
-    const sorted = this.sorted!;
-    const words = this.words;
-    let lo = 0;
-    let hi = sorted.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (words[sorted[mid]!]! < prefix) lo = mid + 1;
-      else hi = mid;
-    }
-    for (let i = lo; i < sorted.length && words[sorted[i]!]!.startsWith(prefix); i++) out.push(sorted[i]!);
-    for (const id of this.pending) if (words[id]!.startsWith(prefix)) out.push(id);
-    return out;
-  }
-
   private nextEpoch(): number {
     if (this.mark.length < this.docs.length) {
       const grown = new Int32Array(Math.max(this.docs.length * 2, 1024));
@@ -888,16 +712,16 @@ export class InboxSearchIndex {
     const n = terms.length;
     const exactIds: number[] = [];
     for (let i = 0; i < n - 1; i++) {
-      const id = this.table.idOf(terms[i]!);
+      const id = this.vocab.idOf(terms[i]!);
       if (id < 0) return [];
       exactIds.push(id);
     }
     const last = terms[n - 1]!;
-    const lastExact = this.table.idOf(last);
-    const prefix = this.prefixIds(last);
+    const lastExact = this.vocab.idOf(last);
+    const prefix = this.vocab.prefixIds(last);
     if (prefix.length === 0) return [];
 
-    if (this.termOf.length < this.words.length) this.termOf = new Int32Array(Math.max(this.words.length * 2, 1024));
+    if (this.termOf.length < this.vocab.size) this.termOf = new Uint8Array(Math.max(Math.ceil(this.vocab.size * 1.25), 1024));
     const termOf = this.termOf;
     const touched: number[] = [];
     const flag = (id: number, bit: number) => {
@@ -915,7 +739,7 @@ export class InboxSearchIndex {
         return list.subarray(0, k);
       };
       if (exactIds.length > 0) {
-        const order = [...exactIds].sort((a, b) => this.postCount[a]! - this.postCount[b]!);
+        const order = [...exactIds].sort((a, b) => this.postings.count(a) - this.postings.count(b));
         candidates = alive(this.postingsOf(order[0]!));
         for (const id of order.slice(1)) {
           const epoch = this.nextEpoch();
@@ -928,7 +752,7 @@ export class InboxSearchIndex {
         }
         // The last term as a prefix: mark its documents, unless they far outnumber the candidates (then each is scanned below anyway).
         let prefixPostings = 0;
-        for (const id of prefix) prefixPostings += this.postCount[id]!;
+        for (const id of prefix) prefixPostings += this.postings.count(id);
         if (prefixPostings <= candidates.length * 32) {
           const epoch = this.nextEpoch();
           for (const id of prefix) {
@@ -942,7 +766,7 @@ export class InboxSearchIndex {
       } else {
         const epoch = this.nextEpoch();
         let total = 0;
-        for (const id of prefix) total += this.postCount[id]!;
+        for (const id of prefix) total += this.postings.count(id);
         const out = new Int32Array(total);
         let k = 0;
         for (const id of prefix) {
@@ -967,9 +791,12 @@ export class InboxSearchIndex {
         const list = this.postingsOf(lastExact);
         for (let i = 0; i < list.length; i++) this.mark[list[i]!] = exactEpoch;
       }
+      // An id-like term matched a shared bucket: the document's own text decides.
+      const idTerms = terms.filter(isIdLikeToken);
       for (let c = 0; c < candidates.length; c++) {
         const d = candidates[c]!;
         const doc = this.docs[d]!;
+        if (idTerms.length > 0 && !this.holdsTokens(doc, idTerms)) continue;
         if (n === 1) {
           // The title needs only the leading tokens.
           out.push({ doc: d, tier: exactEpoch >= 0 && this.mark[d] === exactEpoch ? 2 : 1, title: scanTitle(doc.tokens, doc.titleLen, termOf) });
@@ -982,6 +809,49 @@ export class InboxSearchIndex {
       return out;
     } finally {
       for (const id of touched) termOf[id] = 0;
+    }
+  }
+
+  /** Whether the document's text holds every one of `tokens` as a whole token (the check behind an id-like term's shared bucket). */
+  private holdsTokens(doc: Doc, tokens: readonly string[]): boolean {
+    const wanted = new Set(tokens);
+    for (const text of this.docTexts(doc)) {
+      if (!text) continue;
+      for (const { token } of tokenizeInboxSearchText(text)) wanted.delete(token);
+      if (wanted.size === 0) return true;
+    }
+    return false;
+  }
+
+  /** The texts a document was indexed from, read again from the store. */
+  private docTexts(doc: Doc): string[] {
+    switch (doc.type) {
+      case "thread": {
+        const root = this.store.message(doc.ref);
+        if (!root) return [];
+        const facts = this.factsOf(doc.ref);
+        return [facts?.subject ?? root.subject ?? "", root.thread_name ?? "", this.store.project(root.project_id)?.name ?? ""];
+      }
+      case "message": {
+        const message = this.store.message(doc.ref);
+        if (!message) return [];
+        if (message.author.kind === "person") return [inboxSearchReplyText(message.body)];
+        return [inboxSearchBodyText(message.body), ...this.store.questionsOf(message.id).flatMap(questionTexts), inboxAgentName(message.author)];
+      }
+      case "file": {
+        const hit = this.store.attachment(doc.ref);
+        return hit ? [hit.attachment.name, hit.attachment.path.split(/[\\/]+/).slice(-2).join("/")] : [];
+      }
+      case "guide":
+        return [this.store.message(doc.ref)?.guide?.title ?? ""];
+      case "decision": {
+        const decision = this.store.decision(doc.ref);
+        return decision ? [decision.text, decision.reason ?? ""] : [];
+      }
+      case "project": {
+        const project = this.store.project(doc.ref);
+        return project ? [project.name, project.root] : [];
+      }
     }
   }
 
@@ -1061,7 +931,8 @@ export class InboxSearchIndex {
         const doc = this.docs[hit.doc]!;
         const admitted = admit(doc);
         if (!admitted) continue;
-        const archived = admitted.facts?.archived ?? (doc.type === "decision" ? this.store.decision(doc.ref)?.state !== "current" : false);
+        // A decision ranks as its row reads: archived when replaced or retired, whatever its thread's state.
+        const archived = doc.type === "decision" ? this.store.decision(doc.ref)?.state !== "current" : (admitted.facts?.archived ?? false);
         groups[admitted.group].push({ doc: hit.doc, score: score(hit.tier, hit.title, archived, !!query.current && doc.projectId === query.current, doc.at) });
       }
     }
@@ -1239,7 +1110,7 @@ export class InboxSearchIndex {
 }
 
 /** Any of the first `titleLen` tokens is a term (`termOf` non-zero). */
-function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Int32Array): boolean {
+function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Uint8Array): boolean {
   let p = 0;
   for (let t = 0; t < titleLen; t++) {
     let id = bytes[p++]!;
@@ -1266,7 +1137,7 @@ function scanTitle(bytes: Uint8Array, titleLen: number, termOf: Int32Array): boo
  * is missing, else the tier (3 phrase, 2 every term whole, 1 the last as a
  * prefix) plus 4 when the title fields hold every term.
  */
-function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Int32Array, lastExact: number, lastBit: number, all: number): number {
+function scanDocument(bytes: Uint8Array, titleLen: number, termOf: Uint8Array, lastExact: number, lastBit: number, all: number): number {
   const length = bytes.length;
   let seen = 0;
   let seenTitle = 0;
