@@ -171,6 +171,18 @@ describe("groups and rows", () => {
     }
   });
 
+  test("a long message's row centres on a token, not on letters inside another word", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "logs", root: "/w/logs" });
+    const lines = Array.from({ length: 6000 }, (_, k) => `${1_760_000_000_000 + k} INFO there is nothing to see here`);
+    lines[5200] = "1760000005200 WARN Retry storm after the deploy";
+    const message = store.sendMessage({ project_id: project.id, author: CLAUDE, subject: "Worker log", thread: "log", body: "```\n" + lines.join("\n") + "\n```" }).message;
+    const index = await built(store);
+    const row = search(index, "re").groups!.messages!.find((m) => m.id === message.id) as InboxSearchMessageRow;
+    expect(row.snippet.text).toContain("Retry storm");
+    expect(marked(row.snippet.text, row.snippet.marks)).toEqual(["Re"]);
+  });
+
   test("Show all: one group from an offset; totals stay whole", async () => {
     const store = open();
     const project = store.ensureProject({ name: "api", root: "/w/api" });
@@ -325,6 +337,27 @@ describe("identifiers", () => {
     expect(marked(row.snippet.text, row.snippet.marks).map((m) => m.toLowerCase())).toEqual(["9fceb02d0ae5"]);
   });
 
+  test("ids that share every bit the index keeps are told apart by the text: a 32-bit hash collision between numbers, and long ids sharing 12 characters and 21 hash bits", async () => {
+    const store = open();
+    const project = store.ensureProject({ name: "api", root: "/w/api" });
+    // Two numbers with one FNV-1a hash, and two ULIDs with the same first 12 characters and high 21 hash bits.
+    const pairs: [string, string][] = [
+      ["1760137283784", "1760462493357"],
+      ["01m4v7jerhr00000000000014g", "01m4v7jerhr0000000000008gb"],
+    ];
+    expect(fnvString(pairs[0]![0])).toBe(fnvString(pairs[0]![1]));
+    expect(fnvString(pairs[1]![0]) >>> 11).toBe(fnvString(pairs[1]![1]) >>> 11);
+    const ids = new Map<string, string>();
+    for (const [i, pair] of pairs.entries()) {
+      for (const [k, id] of pair.entries()) ids.set(id, store.sendMessage({ project_id: project.id, author: CLAUDE, subject: `Run ${i}${k}`, thread: `t${i}${k}`, body: `Request ${id.toUpperCase()} failed.` }).message.id);
+    }
+    const index = await built(store);
+    for (const [id, message] of ids) {
+      expect([id, messageIds(search(index, id))]).toEqual([id, [message]]);
+      expect([id, messageIds(search(index, `request ${id}`))]).toEqual([id, [message]]);
+    }
+  });
+
   test("ids whose buckets collide are told apart by their hashes: no false match, and no title match from the other one", async () => {
     const store = open();
     const project = store.ensureProject({ name: "api", root: "/w/api" });
@@ -342,7 +375,7 @@ describe("identifiers", () => {
     expect(rows(`pin ${idB}`)).toEqual([older.id, newer.id]);
   });
 
-  test("an id query reads no document text: whole values, ids in no document, and starts of 7 to 12 characters are decided from the index", async () => {
+  test("an id query reads document text only where an id's full kept hash matched: ids in no document, short ids and starts of 7 to 12 characters read none", async () => {
     const store = open();
     const project = store.ensureProject({ name: "logs", root: "/w/logs" });
     let sample = "";
@@ -363,17 +396,19 @@ describe("identifiers", () => {
       reads += 1;
       return docTexts(doc);
     };
-    for (const q of [sample, `${sample} worker`, `worker ${sample}`, "1760003000148", "1760003000149", "1760003", "deadbeef1234", sample.slice(0, 7), sample.slice(0, 10), `worker ${sample.slice(0, 9)}`]) {
+    for (const q of [sample, `${sample} worker`, `worker ${sample}`, "1760003000149", "1760003", "deadbeef1234", sample.slice(0, 7), sample.slice(0, 10), `worker ${sample.slice(0, 9)}`]) {
       expect(search(index, q).totals!.messages).toBeGreaterThanOrEqual(0);
       expect([q, reads]).toEqual([q, 0]);
     }
     expect(search(index, sample).totals!.messages).toBe(1);
-    expect(search(index, "1760003000148").totals!.messages).toBe(1);
     expect(search(index, "1760003000149").totals!.messages).toBe(0);
     expect(search(index, sample.slice(0, 10)).totals!.messages).toBe(1);
     // Numbers are found by their whole value only.
     expect(search(index, "1760003").totals!.messages).toBe(0);
     expect(reads).toBe(0);
+    // A number is told apart by hash bits only: the one document whose kept hash matches is read to confirm it.
+    expect(search(index, "1760003000148").totals!.messages).toBe(1);
+    expect(reads).toBe(1);
   });
 });
 
