@@ -33,6 +33,8 @@ export interface InboxListProps {
   phone?: boolean;
   /** The project shown (null: every project). A phone opens another project's list at its top, as a mail app opens another mailbox. */
   scope?: string | null;
+  /** Opens search: on a phone, the list header's search icon (inbox.css shows it there only). */
+  onSearch?: (opener: HTMLElement) => void;
 }
 
 function badgeOf(row: InboxListRow): string | null {
@@ -269,6 +271,11 @@ export function InboxList(props: InboxListProps) {
           <span className="ib-path" data-clip="">
             {props.path}
           </span>
+        )}
+        {props.onSearch && (
+          <button type="button" className="ib-lhead-search" data-open-search="" aria-label="Search" aria-haspopup="dialog" onClick={(event) => props.onSearch?.(event.currentTarget)}>
+            <Icon name="search" size={20} />
+          </button>
         )}
       </div>
       <div className="ib-lbody" ref={bodyRef}>

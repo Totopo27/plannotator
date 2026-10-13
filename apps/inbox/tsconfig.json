@@ -15,7 +15,8 @@
       "@plannotator/inbox": ["../../packages/inbox/index.ts"],
       "@plannotator/inbox/*": ["../../packages/inbox/*"],
       "#guide-reader": ["../../packages/inbox/guide/reader-module.d.ts"],
-      "#surface-guide-reader": ["../../packages/inbox/guide/surface-reader-module.d.ts"]
+      "#surface-guide-reader": ["../../packages/inbox/guide/surface-reader-module.d.ts"],
+      "#search-palette": ["../../packages/inbox/search/SearchPalette.tsx"]
     },
     "allowImportingTsExtensions": true,
     "noEmit": true

@@ -23,7 +23,8 @@
       "@plannotator/ui/*": ["../ui/*"],
       // The guide reader's shape; the reader itself is checked by tsconfig.guide.json.
       "#guide-reader": ["./guide/reader-module.d.ts"],
-      "#surface-guide-reader": ["./guide/surface-reader-module.d.ts"]
+      "#surface-guide-reader": ["./guide/surface-reader-module.d.ts"],
+      "#search-palette": ["./search/SearchPalette.tsx"]
     }
   },
   "include": ["**/*.ts", "**/*.tsx"],

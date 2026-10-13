@@ -10,7 +10,8 @@
   },
   "imports": {
     "#guide-reader": "./guide/GuideReader.tsx",
-    "#surface-guide-reader": "./guide/SurfaceGuideReader.tsx"
+    "#surface-guide-reader": "./guide/SurfaceGuideReader.tsx",
+    "#search-palette": "./search/SearchPalette.tsx"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

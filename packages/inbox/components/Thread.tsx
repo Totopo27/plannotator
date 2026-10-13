@@ -16,6 +16,7 @@ import { AnnotationsChip } from './AnnotationsChip';
 import { agentName, clockTime, dayWords, fullTime, plural, whenTime } from '../format';
 import { titleIfClipped } from '../clipTitle';
 import { answerWords, foldSnippet, holdingsOf, isDelivered, isPersonReply, lastNonNote, lookBoundary, newSinceLook, planFolds, snippetText, type FoldSnippet, type Holding } from '../folding';
+import { highlightSearchHits } from '../search/highlight';
 import { AuthorMark, DecisionDiamond, Icon } from '../icons';
 import { PILL_BAND_PX, atEnd, followBy, lookThrough, measureFirstLines, unseenArrivals, useSeenOnSight } from '../seenOnSight';
 import { DecisionCard } from './DecisionCard';
@@ -388,6 +389,15 @@ export interface ThreadPaneProps {
    * list back and put focus on this thread's row. Absent: no such button.
    */
   onBackToList?: (fileName: string | null) => void;
+  /**
+   * A search result to land on (`#thread=…&msg=…`): the message is unfolded
+   * if folded or hidden in the middle fold, scrolled to the centre, focused
+   * and ringed (a question's card when the match was in a question), and the
+   * query's words are highlighted in it until the first click or key in the
+   * thread. `onLanded` then drops `msg=` from the hash.
+   */
+  landing?: { messageId: string; terms: readonly string[]; questionKey: string | null } | null;
+  onLanded?: () => void;
 }
 
 /** The thread's attachments as they are now and the annotations waiting for a Send, kept fresh. */
@@ -419,7 +429,7 @@ function useThreadAttachments(threadId: string, revision: unknown) {
   return { model, load, patch };
 }
 
-export function ThreadPane({ thread, sent, onQuestions, onChanged, onClose, decisions, onOpenDecisionPage, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, row, onMarkRead, onArchive, replyRequest, onReplyOpened, backLabel = 'Inbox', phone = false, stacked = false, fileStacked = false, onBackToList }: ThreadPaneProps) {
+export function ThreadPane({ thread, sent, onQuestions, onChanged, onClose, decisions, onOpenDecisionPage, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, row, onMarkRead, onArchive, replyRequest, onReplyOpened, backLabel = 'Inbox', phone = false, stacked = false, fileStacked = false, onBackToList, landing = null, onLanded }: ThreadPaneProps) {
   const root = thread.messages[0]!;
   const asker = agentName(root.author);
   // Archived (resolved). What an agent wrote after the archive line behaves as
@@ -630,6 +640,86 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, onClose, deci
       }, 1400);
     }
   };
+
+  // ── Landing on a search result (`msg=`; the approved "inbox-search" design) ──
+  // jumpTo's way to a message (unfold, centre, focus), the ring, and the
+  // query's words highlighted in that message with the CSS Custom Highlight
+  // API, cleared on the first click or key in the thread.
+  const landedOn = useRef<string | null>(null);
+  const clearHits = useRef<(() => void) | null>(null);
+  const landingRef = useRef(landing);
+  landingRef.current = landing;
+  const onLandedRef = useRef(onLanded);
+  onLandedRef.current = onLanded;
+  useEffect(() => {
+    const target = landingRef.current;
+    if (!target) {
+      // Landed (msg= dropped): the same result opened again lands again.
+      landedOn.current = null;
+      return;
+    }
+    const key = `${thread.thread_id}/${target.messageId}`;
+    if (landedOn.current === key) return;
+    landedOn.current = key;
+    if (!thread.messages.some((m) => m.id === target.messageId)) {
+      // Not in this thread (a stale link): nothing to land on.
+      onLandedRef.current?.();
+      return;
+    }
+    const land = () => {
+      const body = bodyRef.current;
+      const article = articleOf(target.messageId);
+      if (!body || !article) {
+        onLandedRef.current?.();
+        return;
+      }
+      const card = target.questionKey ? body.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(target.messageId)}"] [data-question-key="${CSS.escape(target.questionKey)}"]`) : null;
+      const element = card ?? article;
+      element.scrollIntoView?.({ block: 'center', behavior: reducedMotion() ? 'auto' : 'smooth' });
+      if (!element.hasAttribute('tabindex')) element.setAttribute('tabindex', '-1');
+      element.focus({ preventScroll: true });
+      element.classList.remove('ib-q-target-out');
+      element.classList.add('ib-q-target');
+      setTimeout(() => {
+        element.classList.add('ib-q-target-out');
+        element.classList.remove('ib-q-target');
+        setTimeout(() => element.classList.remove('ib-q-target-out'), 700);
+      }, 1400);
+      clearHits.current?.();
+      clearHits.current = highlightSearchHits(article, target.terms).clear;
+      onLandedRef.current?.();
+    };
+    // A folded message opens first, then the landing measures it.
+    if (unfold(target.messageId)) requestAnimationFrame(() => requestAnimationFrame(land));
+    else requestAnimationFrame(land);
+    // articleOf reads the body's ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [landing?.messageId, landing?.questionKey, thread, unfold]);
+  useEffect(() => {
+    landedOn.current = null;
+  }, [thread.thread_id]);
+  // The highlight lasts for the visit: the first click or key in the thread clears it.
+  useEffect(() => {
+    const section = sectionRef.current;
+    if (!section) return;
+    const clear = () => {
+      clearHits.current?.();
+      clearHits.current = null;
+    };
+    section.addEventListener('pointerdown', clear, true);
+    section.addEventListener('keydown', clear, true);
+    return () => {
+      section.removeEventListener('pointerdown', clear, true);
+      section.removeEventListener('keydown', clear, true);
+    };
+  }, []);
+  useEffect(
+    () => () => {
+      clearHits.current?.();
+      clearHits.current = null;
+    },
+    [thread.thread_id],
+  );
 
   // Attachments (step 2): the files as they are now, and the annotations that ride the next Send.
   const { model: files, load: reloadFiles, patch: patchRecords } = useThreadAttachments(thread.thread_id, thread);

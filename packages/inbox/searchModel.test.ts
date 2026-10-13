@@ -1,0 +1,67 @@
+/**
+ * Inbox search's palette model (search/model.ts): the group order and its
+ * "Show all" rows, where each result opens (the hash and a message's
+ * landing), what the live region says, the time format and the marked runs.
+ */
+import { expect, test } from 'bun:test';
+import type { InboxSearchRow } from '@plannotator/core/inbox-search';
+import { countWords, markedRuns, moreLabel, resultTarget, searchGroups, searchTime } from './search/model';
+
+const project = { id: 'prj_a', name: 'api' };
+const base = { project, section: 'quiet' as const, archived: false, at: '2026-10-09T14:03:00Z' };
+const thread: InboxSearchRow = { type: 'thread', id: 'msg_t', thread_id: 'msg_t', ...base, title: 'T', title_marks: [], thread_name: null };
+const message: InboxSearchRow = { type: 'message', id: 'msg_m', thread_id: 'msg_t', ...base, author: { kind: 'me', name: 'You' }, title: 'T', snippet: { text: 'x', marks: [] }, question: { key: 'q-1', replaced: false } };
+const file: InboxSearchRow = { type: 'file', id: 'att_f', thread_id: 'msg_t', message_id: 'msg_m', ...base, name: 'a.md', name_marks: [], folder: 'docs', kind: 'md', title: 'T' };
+const guide: InboxSearchRow = { ...file, type: 'guide', id: 'msg_g', message_id: 'msg_g', folder: null, kind: 'guide' };
+const decision: InboxSearchRow = { type: 'decision', id: 'dec_d', ...base, text: 'D', text_marks: [], state: 'current', from: 'me' };
+const projectRow: InboxSearchRow = { type: 'project', id: 'prj_a', project, name: 'api', name_marks: [], root: '/w/api', at: base.at };
+
+test('groups in the fixed order, empty ones left out, "Show all" while a group holds more', () => {
+  const totals = { threads: 1, messages: 23, files: 0, decisions: 1, projects: 0 };
+  const groups = searchGroups({ groups: { decisions: [decision], messages: [message], threads: [thread] }, totals, recent: null });
+  expect(groups.map((g) => g.id)).toEqual(['threads', 'messages', 'decisions']);
+  const more = groups[1]!.options.at(-1)!;
+  expect(more).toEqual({ kind: 'more', group: 'messages', total: 23, shown: 1 });
+  expect(moreLabel(more as never)).toBe('Show all 23 messages');
+  expect(moreLabel({ kind: 'more', group: 'messages', total: 1284, shown: 50 })).toBe('Show 50 more');
+  expect(groups[1]!.total).toBe(23);
+});
+
+test('the recent view: recent searches, then the threads looked at last', () => {
+  const groups = searchGroups({ groups: null, totals: null, recent: [thread as never], recent_searches: ['rate limit'] });
+  expect(groups.map((g) => [g.id, g.heading])).toEqual([['recent-searches', 'Recent searches'], ['recent', 'Recent']]);
+});
+
+test('where each result opens', () => {
+  expect(resultTarget(thread, ['x'])).toEqual({ hash: '#thread=msg_t', land: null });
+  expect(resultTarget(message, ['rate', 'lim'])).toEqual({ hash: '#thread=msg_t&msg=msg_m', land: { messageId: 'msg_m', terms: ['rate', 'lim'], questionKey: 'q-1' } });
+  expect(resultTarget(file, []).hash).toBe('#thread=msg_t&file=att_f');
+  expect(resultTarget(guide, []).hash).toBe('#thread=msg_t&guide=msg_g');
+  expect(resultTarget(decision, []).hash).toBe('#decisions=prj_a&decision=dec_d');
+  expect(resultTarget(projectRow, []).hash).toBe('#project=prj_a');
+});
+
+test('the live region: counts with Intl, no matches by name, silent for the recent view and while indexing', () => {
+  expect(countWords({ totals: { threads: 2, messages: 1282, files: 0, decisions: 0, projects: 0 }, recent: null }, 'deploy', false)).toBe('1,284 results in 2 groups');
+  expect(countWords({ totals: { threads: 1, messages: 0, files: 0, decisions: 0, projects: 0 }, recent: null }, 'x', false)).toBe('1 result in 1 group');
+  expect(countWords({ totals: { threads: 0, messages: 0, files: 0, decisions: 0, projects: 0 }, recent: null }, ' rate limitr ', false)).toBe('No matches for rate limitr');
+  expect(countWords({ totals: null, recent: [] }, '', false)).toBe('');
+  expect(countWords({ totals: null, recent: null, indexing: true }, 'x', false)).toBe('');
+});
+
+test('times: today, this year, another year', () => {
+  const now = new Date(2026, 9, 13, 15, 0);
+  expect(searchTime(new Date(2026, 9, 13, 11, 42).toISOString(), now)).toBe('11:42 AM');
+  expect(searchTime(new Date(2026, 9, 9, 14, 3).toISOString(), now)).toBe('Oct 9');
+  expect(searchTime(new Date(2025, 8, 2, 16, 20).toISOString(), now)).toBe('Sep 2, 2025');
+});
+
+test('marked runs follow the marks, ignore overlaps', () => {
+  expect(markedRuns('the rate limit', [[4, 4], [9, 3], [5, 2]])).toEqual([
+    { text: 'the ', mark: false },
+    { text: 'rate', mark: true },
+    { text: ' ', mark: false },
+    { text: 'lim', mark: true },
+    { text: 'it', mark: false },
+  ]);
+});

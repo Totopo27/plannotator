@@ -1,0 +1,320 @@
+/**
+ * Inbox search in a real browser against the compiled binary (the approved
+ * "inbox-search" design), with agents writing through `plannotator inbox mcp`
+ * (tests/e2e/inbox-search-world.ts seeds the mock's store):
+ *
+ *  - the sidebar's Search entry opens the palette (a modal dialog, the input
+ *    a combobox over a listbox); no key opens it (⌘K, Ctrl+K and `/` do nothing);
+ *  - an empty query lists the threads looked at last;
+ *  - typing groups the results (Threads, Messages, Files, Decisions), the
+ *    matched words semibold, the live region says how many;
+ *  - ↓ moves the highlight (`aria-activedescendant`), Enter on a message
+ *    lands on it: the thread opens, the message focused and ringed, the
+ *    query's words highlighted (CSS Custom Highlight API), `msg=` dropped from
+ *    the hash; the first click in the thread clears the highlight;
+ *  - recent searches come back next time, and Clear forgets them;
+ *  - filters: a chip's menu by keyboard, Escape closes the menu before the
+ *    palette, archived results labelled, "No matches" names the scope and
+ *    "Search everywhere" clears it; focus returns to the Search entry;
+ *  - long, right-to-left and CJK text never overflows the palette;
+ *  - ⌘/Ctrl+Enter opens a new tab and keeps the palette open;
+ *  - a phone: the list header's search icon opens a full-screen sheet with
+ *    Cancel; a result opens the thread, and Back returns to the list.
+ *
+ * Build the binary first (see inbox.spec.ts), then `bun run test:e2e:inbox`.
+ * PNGs land in .local/proof/search/ (PLANNOTATOR_E2E_PROOF_DIR).
+ */
+
+import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { seedSearchWorld, type SearchWorld } from './inbox-search-world';
+
+const repo = resolve(__dirname, '../..');
+const binary = resolve(process.env.PLANNOTATOR_E2E_BINARY ?? join(repo, '.local/plannotator'));
+const proofDir = join(resolve(process.env.PLANNOTATOR_E2E_PROOF_DIR ?? join(repo, '.local/proof')), 'search');
+
+let url = '';
+let world: SearchWorld;
+let context: BrowserContext;
+let page: Page;
+const errors: string[] = [];
+
+async function shot(p: Page, name: string, schemes: readonly ('light' | 'dark')[] = ['light', 'dark']): Promise<void> {
+  for (const scheme of schemes) {
+    await p.emulateMedia({ colorScheme: scheme, reducedMotion: 'reduce' });
+    await p.waitForTimeout(150);
+    await p.screenshot({ path: join(proofDir, `${name}-${scheme}.png`) });
+  }
+  await p.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+}
+
+const palette = (p: Page) => p.locator('dialog[data-search-palette]');
+const input = (p: Page) => palette(p).getByRole('combobox');
+
+async function openFromSidebar(p: Page): Promise<void> {
+  await p.locator('.ib-side .ib-sp-entry').first().click();
+  await expect(palette(p)).toBeVisible();
+  await expect(input(p)).toBeFocused();
+}
+
+async function settled(p: Page): Promise<void> {
+  await expect(palette(p).locator('.ib-sp-list')).not.toHaveAttribute('data-dim', '');
+  await expect(palette(p).locator('[data-search-indexing]')).toHaveCount(0);
+}
+
+test.describe.configure({ mode: 'serial' });
+
+test.beforeAll(async ({ browser }: { browser: Browser }) => {
+  expect(existsSync(binary), `build the binary first: ${binary}`).toBe(true);
+  rmSync(proofDir, { recursive: true, force: true });
+  mkdirSync(proofDir, { recursive: true });
+  const root = inboxScratch('plannotator-inbox-search-e2e-');
+  const env = { PATH: process.env.PATH ?? '', HOME: root, PLANNOTATOR_DATA_DIR: join(root, 'data'), PLANNOTATOR_BROWSER: 'none', PLANNOTATOR_INBOX_CONNECT: '0' };
+  const started = spawnSync(binary, ['inbox', '--background'], { env, encoding: 'utf8', timeout: 60_000 });
+  expect(started.status, started.stderr).toBe(0);
+  url = started.stdout.trim();
+  world = await seedSearchWorld({ binary, env, root, url });
+  context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
+  page = await context.newPage();
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push(message.text());
+  });
+});
+
+test.afterAll(async () => {
+  try {
+    if (world) await Promise.all(world.agents.map((a) => a.close().catch(() => {})));
+    await context?.close();
+  } finally {
+    await removeInboxScratch();
+  }
+});
+
+test('the Search entry sits under the Tater mark; no key opens the palette', async () => {
+  await page.goto(url);
+  const entry = page.locator('.ib-side .ib-sp-entry');
+  await expect(entry).toHaveText('Search');
+  await expect(entry).toHaveAttribute('aria-haspopup', 'dialog');
+  // Under the brand, above Inbox.
+  const brand = await page.locator('.ib-side .ib-brand').boundingBox();
+  const box = await entry.boundingBox();
+  const inbox = await page.locator('.ib-side .ib-nav').first().boundingBox();
+  expect(box!.y).toBeGreaterThan(brand!.y);
+  expect(box!.y).toBeLessThan(inbox!.y);
+  // The phone header's icon is not drawn on a desktop.
+  await expect(page.locator('.ib-lhead .ib-lhead-search')).toBeHidden();
+  for (const key of ['Meta+k', 'Control+k', '/']) {
+    await page.keyboard.press(key);
+    await expect(palette(page)).toHaveCount(0);
+  }
+  await shot(page, '01-closed');
+});
+
+test('an empty query lists the threads looked at last; typing groups the results with the matched words in semibold', async () => {
+  await openFromSidebar(page);
+  await settled(page);
+  const recent = palette(page).locator('[data-search-group="recent"] [data-result="thread"]');
+  await expect(recent.first()).toBeVisible();
+  expect(await recent.evaluateAll((rows) => rows.map((r) => r.getAttribute('data-result-id')))).toContain(world.threads.relay);
+  // Combobox semantics.
+  await expect(input(page)).toHaveAttribute('aria-expanded', 'true');
+  await expect(input(page)).toHaveAttribute('aria-autocomplete', 'list');
+  const listId = await input(page).getAttribute('aria-controls');
+  await expect(page.locator(`#${listId}`)).toHaveAttribute('role', 'listbox');
+  await shot(page, '02-open-empty');
+
+  await input(page).fill('rate lim');
+  await settled(page);
+  const groups = await palette(page).locator('[data-search-group]').evaluateAll((g) => g.map((x) => x.getAttribute('data-search-group')));
+  expect(groups).toEqual(['threads', 'messages', 'files', 'decisions']);
+  const thread = palette(page).locator(`[data-result="thread"][data-result-id="${world.threads.relay}"]`);
+  await expect(thread).toBeVisible();
+  await expect(thread.locator('.ib-sp-m')).toHaveText(['rate', 'lim']);
+  await expect(thread.locator('.ib-sp-chip')).toHaveText('Stopped');
+  await expect(palette(page).locator('[data-result="file"]').first()).toContainText('relay-rate-limits.md');
+  await expect(palette(page).locator('[data-search-live]')).toHaveText(/^\d+ results? in 4 groups$/);
+  // The first row is highlighted; the input keeps focus.
+  const first = await palette(page).locator('[role="option"]').first().getAttribute('id');
+  await expect(input(page)).toHaveAttribute('aria-activedescendant', first!);
+  await expect(input(page)).toBeFocused();
+  await shot(page, '03-typing-grouped');
+});
+
+test('↓ moves the highlight; Enter on a message lands on it with the words highlighted, and msg= leaves the hash', async () => {
+  await input(page).fill('retry budget');
+  await settled(page);
+  const target = palette(page).locator(`[data-result="message"][data-result-id="${world.retryBudget}"]`);
+  await expect(target).toBeVisible();
+  const options = await palette(page).locator('[role="option"]').evaluateAll((o) => o.map((x) => x.getAttribute('data-result-id')));
+  const at = options.indexOf(world.retryBudget);
+  expect(at).toBeGreaterThanOrEqual(0);
+  for (let i = 0; i < at; i++) await page.keyboard.press('ArrowDown');
+  await expect(input(page)).toHaveAttribute('aria-activedescendant', (await target.getAttribute('id'))!);
+  await expect(target).toHaveAttribute('aria-selected', 'true');
+  await shot(page, '04-message-hit', ['light']);
+  await page.keyboard.press('Enter');
+  await expect(palette(page)).toBeHidden();
+  const article = page.locator(`section.ib-pane [data-message-article="${world.retryBudget}"]`);
+  await expect(article).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.location.hash)).not.toContain('msg=');
+  expect(await page.evaluate(() => window.location.hash)).toContain(`thread=${world.threads.retry}`);
+  // Focused, and the query's words painted without changing the DOM.
+  await expect.poll(() => page.evaluate(() => document.activeElement?.getAttribute('data-message-article') ?? document.activeElement?.closest('[data-message-article]')?.getAttribute('data-message-article') ?? null)).toBe(world.retryBudget);
+  const hits = await page.evaluate(() => {
+    const h = (CSS as unknown as { highlights?: Map<string, Set<Range>> }).highlights?.get('ib-search-hit');
+    return h ? [...h].map((r) => r.toString()) : [];
+  });
+  expect(hits.map((h) => h.toLowerCase())).toEqual(expect.arrayContaining(['retry', 'budget']));
+  await expect(article.locator('mark')).toHaveCount(0);
+  await shot(page, '05-landed-on-message');
+  // The first click in the thread clears the highlight.
+  await page.locator('section.ib-pane h2.ib-subject').click();
+  expect(await page.evaluate(() => (CSS as unknown as { highlights?: Map<string, unknown> }).highlights?.has('ib-search-hit') ?? false)).toBe(false);
+  // Back returns to where the search started.
+  await page.goBack();
+  await expect.poll(() => page.evaluate(() => window.location.hash)).not.toContain(world.threads.retry);
+});
+
+test('recent searches come back on the next open, and Clear forgets them', async () => {
+  await openFromSidebar(page);
+  await settled(page);
+  const recent = palette(page).locator('[data-recent-search]');
+  await expect(recent.first()).toHaveText('retry budget');
+  await recent.first().click();
+  await settled(page);
+  await expect(input(page)).toHaveValue('retry budget');
+  await input(page).fill('');
+  await settled(page);
+  await palette(page).locator('[data-clear-recent]').click();
+  await expect(palette(page).locator('[data-recent-search]')).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await expect(palette(page)).toBeHidden();
+  await expect(page.locator('.ib-side .ib-sp-entry')).toBeFocused();
+});
+
+test('filters: a chip menu by keyboard, Escape closes the menu before the palette, archived results labelled', async () => {
+  await openFromSidebar(page);
+  await input(page).fill('pagination');
+  await settled(page);
+  const archived = palette(page).locator(`[data-result="thread"][data-result-id="${world.threads.pagination}"]`);
+  await expect(archived.locator('.ib-sp-chip')).toHaveText('Archived');
+  // The open thread of the same quality ranks above the archived one.
+  const order = await palette(page).locator('[data-search-group="threads"] [data-result]').evaluateAll((r) => r.map((x) => x.getAttribute('data-result-id')));
+  expect(order.indexOf(world.threads.cliPagination)).toBeLessThan(order.indexOf(world.threads.pagination));
+  // Tab reaches the chips; the Status menu opens; arrows and Enter pick Archived.
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expect(palette(page).locator('[data-chip="status"]')).toBeFocused();
+  await page.keyboard.press('Enter');
+  const menu = palette(page).getByRole('menu');
+  await expect(menu).toBeVisible();
+  await shot(page, '06-filter-menu', ['light']);
+  for (let i = 0; i < 5; i++) await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(menu).toHaveCount(0);
+  await settled(page);
+  await expect(palette(page).locator('[data-chip="status"]')).toHaveText('Archived');
+  await expect(palette(page).locator('[data-search-group="threads"] [data-result]')).toHaveCount(1);
+  await shot(page, '07-filters-applied');
+  // Escape with a menu open closes the menu only.
+  await palette(page).locator('[data-chip="from"]').click();
+  await expect(palette(page).getByRole('menu')).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(palette(page).getByRole('menu')).toHaveCount(0);
+  await expect(palette(page)).toBeVisible();
+  await expect(palette(page).locator('[data-chip="from"]')).toBeFocused();
+  // No matches names the scope; Search everywhere clears it.
+  await input(page).fill('jitter');
+  await settled(page);
+  await expect(palette(page).locator('[data-search-none]')).toContainText('No matches for “jitter”');
+  await expect(palette(page).locator('[data-search-none]')).toContainText('Searched only Archived.');
+  await shot(page, '08-no-results-filtered', ['light']);
+  await palette(page).locator('[data-search-none] [data-clear-filters]').click();
+  await settled(page);
+  await expect(palette(page).locator('[data-result="message"]').first()).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(palette(page)).toBeHidden();
+  await expect(page.locator('.ib-side .ib-sp-entry')).toBeFocused();
+});
+
+test('long, right-to-left and CJK text stays inside the palette', async () => {
+  await openFromSidebar(page);
+  await input(page).fill('deploy');
+  await settled(page);
+  await expect(palette(page).locator(`[data-result="thread"][data-result-id="${world.threads.arabic}"]`)).toBeVisible();
+  await expect(palette(page).locator(`[data-result="thread"][data-result-id="${world.threads.japanese}"]`)).toBeVisible();
+  const overflow = await palette(page).evaluate((dialog) => {
+    const list = dialog.querySelector('.ib-sp-list') as HTMLElement;
+    const rows = [...dialog.querySelectorAll<HTMLElement>('[role="option"]')];
+    return { list: list.scrollWidth - list.clientWidth, rows: rows.filter((r) => r.scrollWidth > r.clientWidth + 1).length };
+  });
+  expect(overflow).toEqual({ list: 0, rows: 0 });
+  // The truncating line carries dir="auto" and its full text in title.
+  const arabic = palette(page).locator(`[data-result="thread"][data-result-id="${world.threads.arabic}"] .ib-sp-p`);
+  await expect(arabic).toHaveAttribute('dir', 'auto');
+  await expect(arabic).toHaveAttribute('title', /تقرير/);
+  await shot(page, '09-stress-long-rtl');
+});
+
+test('⌘/Ctrl+Enter opens the result in a new tab and keeps the palette open', async () => {
+  const opened = context.waitForEvent('page');
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Enter' : 'Control+Enter');
+  const tab = await opened;
+  await tab.waitForLoadState();
+  expect(tab.url()).toContain('#thread=');
+  await expect(palette(page)).toBeVisible();
+  await tab.close();
+  await page.keyboard.press('Escape');
+  await expect(palette(page)).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
+test('a phone: the list header opens a full-screen sheet; a result opens the thread and Back returns to the list', async ({ browser }: { browser: Browser }) => {
+  const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: 'light' });
+  try {
+    const p = await phone.newPage();
+    await p.goto(url);
+    const icon = p.locator('.ib-lhead .ib-lhead-search');
+    await expect(icon).toBeVisible();
+    await shot(p, '20-phone-closed', ['light']);
+    await icon.tap();
+    await expect(palette(p)).toBeVisible();
+    const box = await palette(p).boundingBox();
+    expect(box).toMatchObject({ x: 0, y: 0, width: 390 });
+    await expect(palette(p).locator('[data-search-cancel]')).toBeVisible();
+    expect(await input(p).evaluate((el) => getComputedStyle(el).fontSize)).toBe('16px');
+    await settled(p);
+    await shot(p, '21-phone-open-empty', ['dark']);
+    await input(p).fill('rate lim');
+    await settled(p);
+    const rowHeight = await palette(p).locator('[role="option"]').first().evaluate((el) => el.getBoundingClientRect().height);
+    expect(rowHeight).toBeGreaterThanOrEqual(56);
+    await shot(p, '22-phone-typing');
+    await palette(p).locator(`[data-result="thread"][data-result-id="${world.threads.relay}"]`).tap();
+    await expect(palette(p)).toBeHidden();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'thread');
+    await shot(p, '23-phone-landed', ['dark']);
+    await p.goBack();
+    await expect(p.locator('.pn-inbox')).toHaveAttribute('data-view', 'list');
+    // Cancel closes the sheet.
+    await icon.tap();
+    await palette(p).locator('[data-search-cancel]').tap();
+    await expect(palette(p)).toBeHidden();
+    // The sidebar sheet's Search entry: the sheet closes and the search sheet opens.
+    await p.locator('.ib-lhead .ib-sb-trigger').tap();
+    const sheetEntry = p.locator('.ib-sp-entry').filter({ visible: true });
+    await expect(sheetEntry).toBeVisible();
+    await shot(p, '24-phone-sidebar-entry', ['light']);
+    await sheetEntry.tap();
+    await expect(palette(p)).toBeVisible();
+    await expect(sheetEntry).toBeHidden();
+    await palette(p).locator('[data-search-cancel]').tap();
+    await expect(palette(p)).toBeHidden();
+  } finally {
+    await phone.close();
+  }
+});

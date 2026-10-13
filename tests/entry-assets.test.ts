@@ -185,6 +185,25 @@ describe('review entry assets', () => {
     expect(read('packages/inbox/surface/SurfaceDocument.tsx')).toContain("lazy(() => import('./SurfaceDiagram'))");
   });
 
+  // Inbox search's palette (the approved "inbox-search" design: "the palette
+  // body is lazy, mounted on the first open ... so it never rides the window's
+  // first paint") reaches the window only through SearchHost's one dynamic
+  // import of `#search-palette`. A type-only import is erased; any other
+  // import of the palette module would put it back on the first paint.
+  test('the Inbox window mounts the search palette only through its dynamic import', () => {
+    const palette = /^import\s+(?!type\b)[^;]*from\s+['"](?:#search-palette|[^'"]*search\/SearchPalette(?:\.tsx)?)['"]/m;
+    const walk = (dir: string): string[] =>
+      readdirSync(resolve(root, dir), { withFileTypes: true }).flatMap((entry) =>
+        entry.isDirectory()
+          ? entry.name === 'node_modules' ? [] : walk(`${dir}/${entry.name}`)
+          : /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [`${dir}/${entry.name}`] : [],
+      );
+    const eager = [...walk('packages/inbox'), ...walk('apps/inbox')].filter((path) => palette.test(read(path)));
+    expect(eager).toEqual([]);
+    expect(read('packages/inbox/components/SearchHost.tsx')).toContain("lazy(() => import('#search-palette'))");
+    expect(read('packages/inbox/package.json')).toContain('"#search-palette": "./search/SearchPalette.tsx"');
+  });
+
   // Built-artifact check: a lost eager import would still type-check and pass
   // every unit test, so the built single-file bundles are read directly.
   // Two different kinds of marker, deliberately:

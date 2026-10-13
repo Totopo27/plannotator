@@ -20,6 +20,7 @@ import type {
   InboxThread,
 } from '@plannotator/core/inbox-types';
 import type { QuestionAnswer } from '@plannotator/core/question-block';
+import type { InboxSearchAnswer, InboxSearchFrom, InboxSearchGroupId, InboxSearchStatus } from '@plannotator/core/inbox-search';
 import type { InboxAgentId, InboxAgentsModel, InboxAnnotationRecord, InboxAttachmentState, InboxNoteAgentId } from '@plannotator/core/inbox-types';
 
 export type AgentToolHost = 'claude-code' | 'pi' | 'opencode';
@@ -351,6 +352,39 @@ export interface InboxThemeConfig {
   mode?: 'light' | 'dark' | 'system';
   light?: string;
   dark?: string;
+}
+
+/** GET /api/inbox/search's answer (the wire is @plannotator/core/inbox-search). */
+export type SearchModel = InboxSearchAnswer & { serverSession: string; recent_searches?: string[] };
+
+export interface SearchRequest {
+  q: string;
+  project?: string | null;
+  status?: InboxSearchStatus | null;
+  from?: InboxSearchFrom | null;
+  group?: InboxSearchGroupId | null;
+  offset?: number;
+  limit?: number;
+  /** The project open in the list: a tie boost, never a filter. */
+  current?: string | null;
+}
+
+/** Search (read only). `signal` aborts a request a newer query replaced. */
+export async function searchInbox(request: SearchRequest, signal?: AbortSignal): Promise<SearchModel> {
+  const query = new URLSearchParams({ q: request.q });
+  if (request.project) query.set('project', request.project);
+  if (request.status) query.set('status', request.status);
+  if (request.from) query.set('from', request.from);
+  if (request.group) query.set('group', request.group);
+  if (request.offset) query.set('offset', String(request.offset));
+  if (request.limit) query.set('limit', String(request.limit));
+  if (request.current) query.set('current', request.current);
+  return readJson<SearchModel>(await fetch(`/api/inbox/search?${query}`, { headers: { Accept: 'application/json' }, cache: 'no-store', signal }));
+}
+
+/** Remember a search the person opened a result from (the last 6), or forget them all. */
+export function saveRecentSearch(input: { q: string } | { clear: true }): Promise<{ recent_searches: string[] }> {
+  return post<{ recent_searches: string[] }>('/api/inbox/search/recent', input);
 }
 
 export const inboxApi = {

@@ -25,6 +25,11 @@ export interface SidebarProps {
   restarting: boolean;
   /** This run started on a newer version: "What's new in X" above Settings. */
   updated: string | null;
+  /**
+   * Opens search (the approved "inbox-search" design): the field-shaped entry
+   * under the Tater mark. No key hint, because no key opens it. Absent: no entry.
+   */
+  onSearch?: (opener: HTMLElement) => void;
   onInbox: () => void;
   onProject: (projectId: string) => void;
   onSettings: () => void;
@@ -87,6 +92,23 @@ export function Sidebar(props: SidebarProps) {
         <b>Plannotator</b>
         <span>Inbox</span>
       </div>
+      {props.onSearch && (
+        <button
+          type="button"
+          className="ib-sp-entry"
+          data-open-search=""
+          aria-haspopup="dialog"
+          onClick={(event) => {
+            const opener = event.currentTarget;
+            // On a phone the sheet closes first; the search sheet takes the screen.
+            setOpenMobile(false);
+            props.onSearch?.(opener);
+          }}
+        >
+          <Icon name="search" />
+          Search
+        </button>
+      )}
       <button
         type="button"
         className={`ib-nav${props.page === 'inbox' && props.projectId === null ? ' ib-on' : ''}`}
