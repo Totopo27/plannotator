@@ -9,6 +9,7 @@ import { useSidebar } from '../shell/sidebar';
 import { useInboxTheme } from '../theme';
 import { TaterMark } from './TaterMark';
 import { UpdateButton } from './Updates';
+import { openSearchAriaKeys, openSearchHint } from '../search/searchShortcut';
 
 export interface SidebarProps {
   page: 'inbox' | 'settings' | 'decisions' | 'whats-new';
@@ -98,6 +99,7 @@ export function Sidebar(props: SidebarProps) {
           className="ib-sp-entry"
           data-open-search=""
           aria-haspopup="dialog"
+          aria-keyshortcuts={openSearchAriaKeys()}
           onClick={(event) => {
             const opener = event.currentTarget;
             // On a phone the sheet closes first; the search sheet takes the screen.
@@ -107,6 +109,10 @@ export function Sidebar(props: SidebarProps) {
         >
           <Icon name="search" />
           Search
+          {/* The Inbox's one shortcut (search/searchShortcut.ts); the button's aria-keyshortcuts names it for a screen reader. */}
+          <kbd className="ib-kbd ib-sp-hint" aria-hidden="true" data-search-hint="">
+            {openSearchHint()}
+          </kbd>
         </button>
       )}
       <button

@@ -48,6 +48,7 @@ import { SidebarShell } from './shell/SidebarShell';
 import { InboxList } from './components/InboxList';
 import { ThreadPane } from './components/Thread';
 import { SearchHost, type SearchLanding } from './components/SearchHost';
+import { onOpenSearchKey } from './search/searchShortcut';
 import { EmptyState } from './components/EmptyState';
 import { AgentNoteDialog } from './components/AgentNoteDialog';
 import { cardReport, noteQuestionRows } from './agents';
@@ -887,6 +888,15 @@ function Inbox() {
     setSearchMounted(true);
     setSearchOpen(true);
   };
+  const openSearchRef = useRef(openSearch);
+  openSearchRef.current = openSearch;
+  // ⌘K / Ctrl+K opens search: the Inbox's one shortcut, an owner exception (approval amendment 2026-10-14;
+  // search/searchShortcut.ts). Capture phase, so it also reaches the open palette, whose keys stop at its dialog.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => onOpenSearchKey(event, (opener) => openSearchRef.current(opener));
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
   const closeSearch = (reason: 'dismissed' | 'opened') => {
     setSearchOpen(false);
     if (reason !== 'dismissed') return;

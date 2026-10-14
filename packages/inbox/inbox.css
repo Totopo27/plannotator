@@ -1798,6 +1798,8 @@ details.ib-wn-skipped[open] > summary { margin-bottom: 6px; }
 .pn-inbox .ib-sp-entry { display: flex; align-items: center; gap: 8px; height: 32px; margin: 0 0 8px; padding: 0 9px; width: 100%; flex: none; border-radius: 7px; border: 1px solid var(--ib-line); background: var(--ib-band); color: var(--muted-foreground); font-size: 13.5px; text-align: left; }
 .pn-inbox .ib-sp-entry:hover { color: var(--foreground); border-color: var(--border); }
 .pn-inbox .ib-sp-entry svg.ib-ic { width: 15px; height: 15px; }
+/* ⌘K / Ctrl K, the one Inbox shortcut, at the entry's end. */
+.pn-inbox .ib-sp-entry .ib-sp-hint { margin-left: auto; }
 /* A phone's list header: the search icon beside the sidebar toggle (decision D3). The desktop header has none (D2). */
 .pn-inbox .ib-lhead-search { display: none; }
 
@@ -1888,6 +1890,8 @@ dialog.ib-sp::backdrop { background: oklch(0 0 0 / 0.45); }
   .pn-inbox .ib-lhead-search { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-left: auto; flex: none; border-radius: 8px; color: var(--foreground); background: none; border: 0; }
   /* The sheet's Search entry: a thumb's height, as the sheet's rows. */
   .pn-inbox .ib-sp-entry { height: 44px; font-size: 16px; }
+  /* No keyboard to hint at on a phone. */
+  .pn-inbox .ib-sp-entry .ib-sp-hint { display: none; }
   .pn-inbox dialog.ib-sp[data-phone], dialog.ib-sp[data-phone] { inset: 0; top: 0; width: 100%; height: var(--ib-vvh, 100%); max-height: none; border-radius: 0; box-shadow: none; flex-direction: column; background: var(--card); animation: none; padding-top: env(safe-area-inset-top); }
   dialog.ib-sp[data-phone][open] { display: flex; }
   dialog.ib-sp[data-phone]::backdrop { animation: none; }

@@ -158,6 +158,7 @@ jobs:
           packages/inbox/agentsSettings.test.tsx
           packages/inbox/settingsSections.test.tsx
           packages/inbox/searchPalette.test.tsx
+          packages/inbox/searchShortcut.test.tsx
           packages/ui/components/MenuVersionSection.test.tsx
           packages/ui/components/blocks/QuestionBlock.test.tsx
           packages/ui/components/blocks/QuestionBlock.host.test.tsx
